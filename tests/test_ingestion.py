@@ -26,7 +26,11 @@ from deallens.ingestion import (
     load_pdf,
     verify_evidence,
 )
-from deallens.ingestion.loader import extract_printed_page_label, page_label_to_int
+from deallens.ingestion.loader import (
+    extract_printed_page_label,
+    page_label_to_int,
+    parse_page_label,
+)
 from deallens.ingestion.locators import SourceLocator, normalize_text
 
 from .conftest import requires_bio_techne
@@ -59,18 +63,6 @@ def test_folio_rejects_four_digit_year():
     assert extract_printed_page_label("dated as of June 25,\n2026") is None
 
 
-def test_folio_suppressed_on_contents_page():
-    """
-    A table of contents ends with the page reference of its last entry, which
-    is positionally identical to a folio. This is the real failure observed on
-    Bio-Techne PDF page 8, which claimed printed page 62.
-    """
-    toc = "TABLE OF CONTENTS\n" + "\n".join(
-        f"Section 1.0{i}\nSome Heading\n{50 + i}" for i in range(8)
-    )
-    assert extract_printed_page_label(toc) is None
-
-
 def test_folio_allows_roman_on_contents_page():
     """Contents pages are themselves numbered in roman; those folios are real."""
     toc = "TABLE OF CONTENTS\n" + "\n".join(f"Section\nHeading\n{i}" for i in range(8)) + "\niii"
@@ -79,10 +71,29 @@ def test_folio_allows_roman_on_contents_page():
 
 @pytest.mark.parametrize(
     "label,expected",
-    [("12", 12), ("iv", 4), ("ix", 9), ("xlii", 42), (None, None), ("A-1", None)],
+    [("12", 12), ("iv", 4), ("ix", 9), ("xlii", 42), (None, None), ("A-1", 1)],
 )
 def test_page_label_to_int(label, expected):
     assert page_label_to_int(label) == expected
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("12", ("", 12)),
+        ("iv", ("roman", 4)),
+        ("A-1", ("A", 1)),
+        ("I-12", ("I", 12)),
+        ("not-a-label", None),
+    ],
+)
+def test_parse_page_label_separates_numbering_series(label, expected):
+    """
+    Roman "i" and arabic "1" both have ordinal 1 but belong to independent
+    sequences. Conflating them would let front matter and body text form a
+    single spurious numbering run.
+    """
+    assert parse_page_label(label) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -277,3 +288,24 @@ def test_bio_techne_no_duplicate_or_unreadable_pages(bio_techne_ingested):
     assert report.duplicate_groups == []
     assert report.unreadable_pages == []
     assert report.ingestion_status in {"ingested", "ingested_with_warnings"}
+
+
+@requires_bio_techne
+def test_bio_techne_contents_page_reference_is_not_trusted_as_a_folio(bio_techne_ingested):
+    """
+    Regression: PDF page 8 is a table of contents whose last line is the page
+    reference "62" of its final entry -- positionally identical to a folio.
+    The loader reads it as a candidate; reconciliation must reject it, because
+    it fits no numbering run. The real folio 62 lives on PDF page 71.
+    """
+    labels = bio_techne_ingested.integrity.reconciled_labels
+    assert 8 not in labels
+    assert 9 not in labels
+    assert labels[71] == "62"
+
+
+@requires_bio_techne
+def test_bio_techne_structure_is_unambiguous(bio_techne_ingested):
+    """A one-step merger should not register as a hybrid."""
+    assert bio_techne_ingested.structure.secondary_structures == []
+    assert bio_techne_ingested.structure.review_status == "unreviewed"

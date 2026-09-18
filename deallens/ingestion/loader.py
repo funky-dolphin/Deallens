@@ -31,13 +31,16 @@ SPARSE_TEXT_THRESHOLD = 100
 # Below this, there is effectively no text layer at all on the page.
 EMPTY_TEXT_THRESHOLD = 10
 
-# A page carrying at least this many stand-alone numerals is a reference table
-# -- a table of contents or an index of defined terms -- whose numeric column
-# holds cross-references, not folios.
-REFERENCE_TABLE_NUMERIC_LINES = 5
-
 _ROMAN_RE = re.compile(r"^[ivxlcdm]{1,7}$", re.IGNORECASE)
-_PAGE_LABEL_RE = re.compile(r"^[\-–—\s\[\(]*([0-9]{1,4}|[ivxlcdmIVXLCDM]{1,7})[\-–—\s\]\)]*$")
+
+# Folio grammars, most specific first. Annex and schedule pages are routinely
+# numbered "A-1" or "I-12" rather than continuing the body's sequence; reading
+# only bare numerals would leave every annex page uncitable by its own number.
+_PAGE_LABEL_PATTERNS = (
+    re.compile(r"^[\s\[\(]*([A-Z]{1,3})[\-\u2013](\d{1,4})[\s\]\)]*$"),
+    re.compile(r"^[\-\u2013\u2014\s\[\(]*(\d{1,4})[\-\u2013\u2014\s\]\)]*$"),
+    re.compile(r"^[\-\u2013\u2014\s\[\(]*([ivxlcdmIVXLCDM]{1,7})[\-\u2013\u2014\s\]\)]*$"),
+)
 
 
 @dataclass
@@ -159,37 +162,42 @@ def extract_printed_page_label(text: str) -> str | None:
     if not lines:
         return None
 
-    # On a table of contents the last line is typically the page reference of
-    # the final entry, which is indistinguishable from a folio by position
-    # alone. Such pages are numbered in roman in this document family, so we
-    # suppress arabic candidates there and let roman ones through.
-    looks_like_reference_table = (
-        sum(1 for line in lines if line.isdigit()) >= REFERENCE_TABLE_NUMERIC_LINES
-    )
-
-    # Foot of page first: that is where the folio almost always sits.
+    # Candidates are read liberally here and filtered downstream by
+    # `integrity.reconcile_page_labels`, which only trusts a label that
+    # participates in a consistent numbering run. An earlier version tried to
+    # reject contents-page references at this level by assuming such pages are
+    # numbered in roman -- true of the development filing, false in general,
+    # and it discarded genuine arabic folios. Sequence agreement is the
+    # document-independent test, so it is the only one applied.
     candidates = lines[-3:][::-1] + lines[:2]
     for line in candidates:
-        match = _PAGE_LABEL_RE.match(line)
-        if not match:
-            continue
-        label = match.group(1)
-        # A bare 4-digit number at a page edge is much more likely to be a year
-        # or a dollar amount than a folio in a document of this length.
-        if label.isdigit() and len(label) == 4:
-            continue
-        if label.isdigit() and looks_like_reference_table:
-            continue
-        return label
+        for pattern in _PAGE_LABEL_PATTERNS:
+            match = pattern.match(line)
+            if not match:
+                continue
+            label = "-".join(match.groups())
+            # A bare 4-digit number at a page edge is far more likely to be a
+            # year or a dollar amount than a folio.
+            if label.isdigit() and len(label) == 4:
+                break
+            return label
     return None
 
 
-def page_label_to_int(label: str | None) -> int | None:
-    """Convert a printed label to an integer for sequence checks; None if not ordinal."""
+def parse_page_label(label: str | None) -> tuple[str, int] | None:
+    """
+    Split a printed label into its numbering series and ordinal.
+
+    Returns (series, ordinal), where series distinguishes independent
+    numbering sequences that must never be reconciled against one another:
+    arabic body folios (""), roman front matter ("roman"), and annex series
+    ("A", "I", ...). Without this, roman "i" and arabic "1" both parse to 1
+    and can form a spurious run across a front-matter boundary.
+    """
     if not label:
         return None
     if label.isdigit():
-        return int(label)
+        return ("", int(label))
     if _ROMAN_RE.match(label):
         values = {"i": 1, "v": 5, "x": 10, "l": 50, "c": 100, "d": 500, "m": 1000}
         total = 0
@@ -198,8 +206,17 @@ def page_label_to_int(label: str | None) -> int | None:
             current = values[char]
             total += current if current >= previous else -current
             previous = max(previous, current)
-        return total
+        return ("roman", total)
+    parts = label.split("-", 1)
+    if len(parts) == 2 and parts[1].isdigit() and parts[0].isalpha():
+        return (parts[0].upper(), int(parts[1]))
     return None
+
+
+def page_label_to_int(label: str | None) -> int | None:
+    """Ordinal component of a printed label; None when it is not ordinal."""
+    parsed = parse_page_label(label)
+    return parsed[1] if parsed else None
 
 
 def _page_has_images(page) -> bool:

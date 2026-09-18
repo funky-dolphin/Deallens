@@ -17,12 +17,18 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field, asdict
 
-from .loader import DocumentInventory, page_label_to_int
+from .loader import DocumentInventory, parse_page_label
 
 # A folio run must be at least this long before we trust it to reconcile
 # labels. Two consecutive agreeing pages can happen by coincidence in a
 # document full of numerals; four in a row is a real numbering sequence.
 MIN_OFFSET_RUN = 4
+
+# A duplicated page counts as substantial when it carries at least this share
+# of the document's median page length. Relative rather than absolute, so the
+# control behaves the same on a dense merger agreement and a sparse offer
+# document.
+DUPLICATE_SIGNIFICANCE_RATIO = 0.3
 
 
 @dataclass
@@ -98,10 +104,17 @@ def detect_duplicate_pages(inventory: DocumentInventory) -> tuple[list[list[int]
             continue
         by_hash[page.content_hash].append(page.pdf_page)
 
+    # "Substantial" is judged against this document's own typical page rather
+    # than a fixed character count, because page density varies by an order of
+    # magnitude between a dense agreement and a sparse offer document.
+    densities = sorted(p.char_count for p in inventory.pages if not p.is_empty)
+    median_chars = densities[len(densities) // 2] if densities else 0
+    substantial_floor = max(200, int(median_chars * DUPLICATE_SIGNIFICANCE_RATIO))
+
     groups = sorted([pages for pages in by_hash.values() if len(pages) > 1])
     issues: list[IntegrityIssue] = []
     for pages in groups:
-        substantial = inventory.page(pages[0]).char_count >= 500
+        substantial = inventory.page(pages[0]).char_count >= substantial_floor
         issues.append(
             IntegrityIssue(
                 kind="duplicate_page",
@@ -195,26 +208,30 @@ def reconcile_page_labels(
     run means either a page was dropped from the PDF, or the drafter's own
     numbering jumps. We report the observation and let a human judge which.
     """
-    offsets: dict[int, int] = {}
+    # A run is keyed by (numbering series, offset). Series keeps independent
+    # sequences apart: roman front matter, arabic body folios and an "A-n"
+    # annex are three separate numbering schemes that happen to coexist, and
+    # reconciling one against another would manufacture false agreement.
+    offsets: dict[int, tuple[str, int]] = {}
     for page in inventory.pages:
-        printed = page_label_to_int(page.printed_page)
-        if printed is not None:
-            offsets[page.pdf_page] = page.pdf_page - printed
+        parsed = parse_page_label(page.printed_page)
+        if parsed is not None:
+            series, ordinal = parsed
+            offsets[page.pdf_page] = (series, page.pdf_page - ordinal)
 
-    # Group pages into maximal runs sharing one offset.
-    run_membership: dict[int, int] = {}  # pdf_page -> offset of the run it belongs to
-    offset_counts = Counter(offsets.values())
-    for pdf_page, offset in offsets.items():
+    run_membership: dict[int, tuple[str, int]] = {}
+    key_counts = Counter(offsets.values())
+    for pdf_page, key in offsets.items():
         run_length = 1
         for direction in (-1, 1):
             probe = pdf_page + direction
-            while offsets.get(probe) == offset:
+            while offsets.get(probe) == key:
                 run_length += 1
                 probe += direction
         # Accept a label either because it sits in a long local run, or because
-        # its offset dominates the document overall.
-        if run_length >= MIN_OFFSET_RUN or offset_counts[offset] >= MIN_OFFSET_RUN:
-            run_membership[pdf_page] = offset
+        # its series and offset dominate the document overall.
+        if run_length >= MIN_OFFSET_RUN or key_counts[key] >= MIN_OFFSET_RUN:
+            run_membership[pdf_page] = key
 
     reconciled: dict[int, str] = {}
     rejected: dict[int, str] = {}
@@ -247,7 +264,7 @@ def reconcile_page_labels(
 
 
 def _detect_sequence_gaps(
-    reconciled: dict[int, str], run_membership: dict[int, int]
+    reconciled: dict[int, str], run_membership: dict[int, tuple[str, int]]
 ) -> list[IntegrityIssue]:
     """
     Find breaks in an otherwise continuous printed-page sequence.
@@ -256,12 +273,12 @@ def _detect_sequence_gaps(
     restarts between document layers -- an annex beginning again at page 1 is
     not a missing page.
     """
-    by_offset: dict[int, list[int]] = defaultdict(list)
-    for pdf_page, offset in run_membership.items():
-        by_offset[offset].append(pdf_page)
+    by_offset: dict[tuple[str, int], list[int]] = defaultdict(list)
+    for pdf_page, key in run_membership.items():
+        by_offset[key].append(pdf_page)
 
     issues: list[IntegrityIssue] = []
-    for offset, pdf_pages in sorted(by_offset.items()):
+    for _key, pdf_pages in sorted(by_offset.items()):
         ordered = sorted(pdf_pages)
         for previous, current in zip(ordered, ordered[1:]):
             gap = current - previous

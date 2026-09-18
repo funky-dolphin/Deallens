@@ -65,7 +65,16 @@ REGION_SIGNATURE = "signature"
 # cross-references throughout the agreement; position is what separates a
 # cover page from a mention.
 _EXHIBIT_COVER_RE = re.compile(r"EXHIBIT\s+([0-9]+\.[0-9]+|[A-Z](?![A-Za-z]))", re.I)
-_EXHIBIT_COVER_MAX_OFFSET = 120
+
+# An exhibit label is found by line position rather than character offset.
+# Registrants prefix exhibit covers with running headers of wildly varying
+# length -- an offset tuned to one filing's header silently misses another's,
+# merging the agreement into the filing summary. What is stable is that the
+# label sits within the first few lines and stands alone as a short label,
+# not buried in prose. A cross-reference to "Exhibit A" inside a sentence is
+# on a long line; a cover label is not.
+_EXHIBIT_COVER_MAX_LINES = 5
+_EXHIBIT_LABEL_MAX_WORDS = 6
 
 _SEC_COVER_RE = re.compile(
     r"UNITED\s+STATES\s+SECURITIES\s+AND\s+EXCHANGE\s+COMMISSION"
@@ -180,6 +189,24 @@ def _page_head(text: str, chars: int = 400) -> str:
     return " ".join(text.split())[:chars]
 
 
+def _exhibit_label_on(text: str) -> str | None:
+    """
+    Return the exhibit number if this page opens an exhibit, else None.
+
+    Requires the label to appear near the top of the page on a short,
+    label-like line, which distinguishes a cover page from the many pages that
+    merely cross-reference an exhibit in prose.
+    """
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    for line in lines[:_EXHIBIT_COVER_MAX_LINES]:
+        if len(line.split()) > _EXHIBIT_LABEL_MAX_WORDS:
+            continue
+        match = _EXHIBIT_COVER_RE.search(line)
+        if match:
+            return match.group(1).upper()
+    return None
+
+
 def segment_layers(inventory: DocumentInventory) -> list[DocumentLayer]:
     """
     Partition the document into top-level layers, then into regions.
@@ -193,14 +220,13 @@ def segment_layers(inventory: DocumentInventory) -> list[DocumentLayer]:
         if not head:
             continue
 
-        sec_match = _SEC_COVER_RE.search(head[:_EXHIBIT_COVER_MAX_OFFSET * 3])
+        sec_match = _SEC_COVER_RE.search(head)
         if sec_match and not boundaries:
             boundaries.append((page.pdf_page, LAYER_FILING_SUMMARY, None, sec_match.group(0)[:120]))
             continue
 
-        exhibit_match = _EXHIBIT_COVER_RE.search(head)
-        if exhibit_match and exhibit_match.start() <= _EXHIBIT_COVER_MAX_OFFSET:
-            number = exhibit_match.group(1).upper()
+        number = _exhibit_label_on(page.text)
+        if number:
             layer_id, label = _instrument_for(head)
             boundaries.append((page.pdf_page, layer_id, number, f"Exhibit {number}: {label}"))
 
@@ -404,6 +430,10 @@ class StructureClassification:
 
     structure: str
     confidence: float
+    # Structures with material support beyond the primary one. A two-step
+    # tender offer with a back-end merger genuinely exhibits both, and that
+    # is information to carry forward, not a classification failure.
+    secondary_structures: list[str] = field(default_factory=list)
     scores: dict[str, int] = field(default_factory=dict)
     evidence: list[dict] = field(default_factory=list)
     detection_method: str = "deterministic"
@@ -478,21 +508,34 @@ def classify_structure(
             ),
         )
 
+    total = sum(scores.values())
+
     if runner_up_score and top_score < runner_up_score * STRUCTURE_MIN_RATIO:
+        # Two recognised structures both well-evidenced is a hybrid, not an
+        # absence of signal. Collapsing it to `unknown` would discard a
+        # correct reading; instead the primary is reported, the secondary
+        # recorded, and the document routed to review so a human confirms
+        # which mechanic governs timing and conditionality.
+        secondary = [
+            name
+            for name, score in ranked[1:]
+            if score >= STRUCTURE_MIN_SCORE or score >= top_score / STRUCTURE_MIN_RATIO
+        ]
         return StructureClassification(
-            structure="unknown",
-            confidence=round(top_score / (top_score + runner_up_score), 2),
+            structure=top_structure,
+            confidence=round(top_score / total, 2) if total else 0.0,
+            secondary_structures=secondary,
             scores=scores,
-            evidence=evidence,
+            evidence=[e for e in evidence if e["structure"] in {top_structure, *secondary}],
             review_status="exception",
             note=(
-                f"Ambiguous: '{top_structure}' ({top_score}) does not clearly lead "
-                f"'{ranked[1][0]}' ({runner_up_score}). This may be a hybrid "
-                "structure such as a tender offer with a back-end merger."
+                f"Hybrid structure: '{top_structure}' ({top_score}) does not clearly "
+                f"lead '{ranked[1][0]}' ({runner_up_score}). Commonly a tender offer "
+                "with a back-end merger. Primary structure reported; confirm which "
+                "mechanic governs timing and conditionality before relying on it."
             ),
         )
 
-    total = sum(scores.values())
     return StructureClassification(
         structure=top_structure,
         confidence=round(top_score / total, 2) if total else 0.0,
