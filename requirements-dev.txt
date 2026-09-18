@@ -1,0 +1,6 @@
+# Development and test dependencies.
+# Kept separate from requirements.txt so the deployed Streamlit app does not
+# install test tooling in production.
+-r requirements.txt
+pytest>=8.0.0
+pytest-cov>=5.0.0
