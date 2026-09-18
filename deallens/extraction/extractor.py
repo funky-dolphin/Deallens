@@ -1,283 +1,378 @@
 """
-extractor.py
-Sends PDF to Claude API and returns structured extraction results.
-Handles arbitrarily large PDFs via chunked extraction with field merging.
+Structured transaction extraction (Workstream 2).
+
+Extraction runs **per document layer**, and results from different layers are
+never merged. This is the central design change from the original scaffold,
+which extracted across the whole filing and collapsed results with a
+highest-confidence-wins merge.
+
+That merge was wrong in a way that would not have been visible in the output.
+A filing summary and the agreement it summarises frequently state the same
+term differently -- rounded, simplified, or genuinely inconsistent -- and the
+assignment requires those differences be surfaced and classified, not
+resolved. Keeping one value and discarding the other destroys the very
+evidence Workstream 3 exists to report, and produces a confident single answer
+where the honest output is "these two sources disagree".
+
+Within a single layer, extraction may still be split across chunks when the
+layer exceeds the API's page limit. Those results *are* reconciled, because
+they are readings of one document -- but conflicting readings are recorded as
+conflicts rather than silently resolved.
 """
 
-import anthropic
-import base64
-import hashlib
-import json
+from __future__ import annotations
+
 import uuid
-from datetime import datetime
-from io import BytesIO
+from dataclasses import dataclass, field
 
-try:
-    from pypdf import PdfReader, PdfWriter
-    PYPDF_AVAILABLE = True
-except ImportError:
-    PYPDF_AVAILABLE = False
+from ..ingestion.classifier import DocumentLayer
+from ..ingestion.locators import compute_anchor, verify_evidence
+from ..ingestion.pipeline import IngestionResult
+from . import models
+from .client import (
+    MAX_PAGES_PER_REQUEST,
+    MODEL_ID,
+    ExtractionResponse,
+    extract_structured,
+    slice_pdf,
+)
+from .models import ExtractedField
+from .prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_output_schema, build_user_prompt
+from .registry import FieldSpec, fields_for, inapplicable_fields
 
+# Layers worth extracting from, in the order they are reported. Constitutional
+# documents and press releases are not sources of deal terms.
+EXTRACTABLE_LAYERS = ("filing-summary", "agreement")
 
-EXTRACTION_PROMPT = """
-You are a financial document analyst specializing in M&A transaction agreements.
-
-Analyze this document and extract the following fields. For each field, return a JSON object with exactly this structure:
-
-{
-  "field_name": "<field name>",
-  "normalized_value": "<cleaned, normalized value or null if not found>",
-  "currency": "<currency code if applicable, else null>",
-  "raw_value": "<exact text from document>",
-  "document_layer": "<8-k-summary | merger-agreement | exhibit | unknown>",
-  "page": <page number as integer or null>,
-  "section": "<section heading where found>",
-  "evidence": "<direct quote from document supporting this value, max 200 chars>",
-  "extraction_method": "llm",
-  "confidence": <0.0 to 1.0>
-}
-
-If a field cannot be found IN THIS SECTION, return the object with normalized_value as null, confidence as 0.0, and evidence as null.
-
-FIELDS TO EXTRACT:
-
-Transaction Identity:
-- target_company
-- acquirer_company
-- merger_subsidiary
-- guarantors
-- agreement_date
-- transaction_type (merger | tender_offer | takeover | other)
-- consideration_per_share
-- consideration_currency
-- total_transaction_value
-
-Timing:
-- expected_closing_date
-- outside_date
-- long_stop_date
-- extension_conditions
-
-Conditions:
-- shareholder_approval_threshold
-- antitrust_approvals_required
-- financing_condition (yes | no | null)
-- material_adverse_effect_condition
-
-Termination:
-- target_termination_fee
-- parent_termination_fee
-- fee_triggers
-
-Financing:
-- funding_sources
-- bridge_financing_amount
-- bridge_financing_currency
-- debt_commitment
-
-Return ONLY a valid JSON array of field objects. No explanation text outside the JSON.
-"""
-
-CHUNK_SIZE = 40  # pages per API call
+# Leave headroom under the hard API limit so a chunk boundary never lands on it.
+PAGES_PER_CHUNK = 400
 
 
-def compute_checksum(pdf_bytes):
-    """SHA-256 checksum of PDF bytes."""
-    return hashlib.sha256(pdf_bytes).hexdigest()
+@dataclass
+class LayerExtraction:
+    """Fields extracted from one document layer."""
+
+    layer_id: str
+    layer_label: str
+    fields: list[ExtractedField] = field(default_factory=list)
+    chunk_count: int = 1
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def found_count(self) -> int:
+        return sum(1 for f in self.fields if f.status == models.FOUND)
 
 
-def split_pdf(pdf_bytes, chunk_size=CHUNK_SIZE):
+@dataclass
+class ExtractionRun:
+    """Complete extraction across every extractable layer of one document."""
+
+    document_id: str
+    run_id: str
+    model_id: str
+    prompt_version: str
+    layers: list[LayerExtraction] = field(default_factory=list)
+    fields: list[ExtractedField] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    error: str | None = None
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(l.input_tokens for l in self.layers)
+
+    @property
+    def total_output_tokens(self) -> int:
+        return sum(l.output_tokens for l in self.layers)
+
+    @property
+    def total_cache_read_tokens(self) -> int:
+        return sum(l.cache_read_tokens for l in self.layers)
+
+    def by_status(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for record in self.fields:
+            counts[record.status] = counts.get(record.status, 0) + 1
+        return counts
+
+
+def _chunk_pages(pages: list[int], size: int = PAGES_PER_CHUNK) -> list[list[int]]:
+    return [pages[start : start + size] for start in range(0, len(pages), size)]
+
+
+def _record_from_payload(
+    field_name: str,
+    payload: dict,
+    ingestion: IngestionResult,
+    layer: DocumentLayer,
+    page_map: list[int],
+) -> ExtractedField:
     """
-    Split a PDF into chunks of `chunk_size` pages.
-    Returns list of (start_page, pdf_bytes_chunk) tuples.
-    Page numbers are 0-indexed internally, 1-indexed in output metadata.
+    Turn one field's raw model output into an ExtractedField with provenance.
+
+    The model reports a page counted within the excerpt it was given;
+    `page_map` translates that back to a page of the source PDF. Getting this
+    wrong would produce citations that look precise and point at the wrong
+    page, so an out-of-range page is treated as no page at all rather than
+    clamped to a plausible one.
     """
-    reader = PdfReader(BytesIO(pdf_bytes))
-    total_pages = len(reader.pages)
-    chunks = []
-
-    for start in range(0, total_pages, chunk_size):
-        end = min(start + chunk_size, total_pages)
-        writer = PdfWriter()
-        for page_num in range(start, end):
-            writer.add_page(reader.pages[page_num])
-
-        buf = BytesIO()
-        writer.write(buf)
-        chunks.append((start + 1, buf.getvalue()))  # 1-indexed start page
-
-    return chunks, total_pages
-
-
-def parse_json_response(raw_response):
-    """Strip markdown fences and parse JSON array from Claude response."""
-    clean = raw_response.strip()
-    if clean.startswith("```"):
-        parts = clean.split("```")
-        # parts[1] is the content between first pair of fences
-        clean = parts[1]
-        if clean.startswith("json"):
-            clean = clean[4:]
-    clean = clean.strip()
-    return json.loads(clean)
-
-
-def extract_chunk(client, pdf_bytes_chunk, chunk_start_page):
-    """
-    Send one PDF chunk to Claude and return extracted fields.
-    Adjusts page numbers to reflect position in the original document.
-    """
-    pdf_b64 = base64.standard_b64encode(pdf_bytes_chunk).decode("utf-8")
-
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=8192,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": EXTRACTION_PROMPT
-                    }
-                ]
-            }
-        ]
+    record = ExtractedField(
+        field_name=field_name,
+        document_id=ingestion.document_id,
+        run_id=ingestion.run_id,
+        document_layer=layer.qualified_id,
+        extraction_method="llm",
+        model_id=MODEL_ID,
+        prompt_version=PROMPT_VERSION,
     )
 
-    fields = parse_json_response(response.content[0].text)
+    if not payload.get("found"):
+        record.status = models.NOT_FOUND
+        record.confidence = 0.0
+        return record
 
-    # Offset page numbers so they reflect position in the full document
-    for field in fields:
-        if field.get("page") is not None:
-            field["page"] = field["page"] + chunk_start_page - 1
-
-    return fields
-
-
-def merge_fields(all_chunk_fields):
-    """
-    Merge field lists from multiple chunks.
-    For each field_name, keep the result with the highest confidence.
-    If two results tie, prefer the one with non-null normalized_value.
-    """
-    best = {}  # field_name -> best field dict
-
-    for fields in all_chunk_fields:
-        for field in fields:
-            name = field.get("field_name")
-            if not name:
-                continue
-
-            existing = best.get(name)
-            if existing is None:
-                best[name] = field
-                continue
-
-            existing_conf = existing.get("confidence", 0.0) or 0.0
-            new_conf = field.get("confidence", 0.0) or 0.0
-            existing_has_value = existing.get("normalized_value") not in (None, "null", "")
-            new_has_value = field.get("normalized_value") not in (None, "null", "")
-
-            # Prefer higher confidence; break ties by preferring non-null value
-            if new_conf > existing_conf or (new_conf == existing_conf and new_has_value and not existing_has_value):
-                best[name] = field
-
-    return list(best.values())
-
-
-def extract_from_pdf(pdf_bytes, filename, source_url=None, api_key=None, progress_callback=None):
-    """
-    Extract structured fields from a PDF of any size.
-    Large PDFs are split into chunks; results are merged by highest confidence.
-
-    Args:
-        pdf_bytes: Raw PDF bytes
-        filename: Original filename
-        source_url: Optional source URL
-        api_key: Anthropic API key
-        progress_callback: Optional callable(chunk_num, total_chunks, message)
-
-    Returns:
-        dict with keys: document_meta, fields, run_id, error, page_count, chunk_count
-    """
-    run_id = str(uuid.uuid4())
-    checksum = compute_checksum(pdf_bytes)
-    document_id = f"doc_{checksum[:12]}"
-
-    if not PYPDF_AVAILABLE:
-        return {
-            "document_meta": None,
-            "fields": [],
-            "run_id": run_id,
-            "error": "pypdf is not installed. Run: pip install pypdf"
-        }
-
+    record.raw_value = (payload.get("raw_value") or "").strip() or None
+    record.evidence = (payload.get("evidence") or "").strip() or None
+    record.section = (payload.get("section") or "").strip() or None
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        record.confidence = float(payload.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        record.confidence = 0.0
+        record.add_note("Model returned a non-numeric confidence; treated as 0.")
+    record.confidence = min(max(record.confidence, 0.0), 1.0)
 
-        # Split PDF into chunks
-        chunks, total_pages = split_pdf(pdf_bytes, chunk_size=CHUNK_SIZE)
-        total_chunks = len(chunks)
+    excerpt_page = payload.get("page") or 0
+    if isinstance(excerpt_page, int) and 1 <= excerpt_page <= len(page_map):
+        record.pdf_page = page_map[excerpt_page - 1]
+    else:
+        record.add_note(
+            f"Model reported page {excerpt_page!r}, which is outside this "
+            f"excerpt of {len(page_map)} page(s). No page recorded."
+        )
 
-        if progress_callback:
-            progress_callback(0, total_chunks, f"Split into {total_chunks} chunks ({total_pages} pages total)")
+    if record.pdf_page is not None:
+        locator = ingestion.locator_for(
+            record.pdf_page, section=record.section, evidence=record.evidence
+        )
+        record.locator_uri = locator.to_uri()
+        record.printed_page = locator.printed_page
 
-        # Extract from each chunk
-        all_chunk_fields = []
-        for i, (start_page, chunk_bytes) in enumerate(chunks):
-            if progress_callback:
-                progress_callback(i, total_chunks, f"Processing pages {start_page}–{min(start_page + CHUNK_SIZE - 1, total_pages)} (chunk {i+1}/{total_chunks})")
+    return record
 
-            chunk_fields = extract_chunk(client, chunk_bytes, start_page)
-            all_chunk_fields.append(chunk_fields)
 
-        if progress_callback:
-            progress_callback(total_chunks, total_chunks, "Merging results...")
+def _finalise(record: ExtractedField, ingestion: IngestionResult) -> ExtractedField:
+    """Apply normalization and the fail-closed controls, verifying evidence."""
+    page_text = (
+        ingestion.inventory.text_for(record.pdf_page)
+        if record.pdf_page is not None
+        else None
+    )
+    return models.finalise(
+        record,
+        verify_evidence_fn=verify_evidence if page_text is not None else None,
+        page_text=page_text,
+    )
 
-        # Merge: best result per field across all chunks
-        merged_fields = merge_fields(all_chunk_fields)
 
-        document_meta = {
-            "document_id": document_id,
-            "filename": filename,
-            "source_url": source_url,
-            "checksum": checksum,
-            "ingestion_timestamp": datetime.utcnow().isoformat(),
-            "is_machine_readable": True,
-            "run_id": run_id,
-            "page_count": total_pages,
-            "chunk_count": total_chunks
-        }
+def reconcile_within_layer(
+    candidates: list[ExtractedField], field_name: str
+) -> ExtractedField:
+    """
+    Combine several chunks' readings of the same field within one layer.
 
-        return {
-            "document_meta": document_meta,
-            "fields": merged_fields,
-            "run_id": run_id,
-            "error": None,
-            "page_count": total_pages,
-            "chunk_count": total_chunks
-        }
+    Agreement on the normalized value is treated as corroboration and the
+    best-evidenced reading is kept. Disagreement is recorded as a conflict:
+    the value is withheld, both readings are preserved in the notes, and the
+    field is routed to review. A critical field never auto-resolves.
+    """
+    answerable = [c for c in candidates if c.is_answerable]
+    if not answerable:
+        # Prefer an informative failure over a bare not_found.
+        for status in (models.UNRESOLVED, models.NOT_FOUND):
+            match = next((c for c in candidates if c.status == status), None)
+            if match:
+                return match
+        return candidates[0]
 
-    except json.JSONDecodeError as e:
-        return {
-            "document_meta": None,
-            "fields": [],
-            "run_id": run_id,
-            "error": f"JSON parsing error: {str(e)}"
-        }
-    except Exception as e:
-        return {
-            "document_meta": None,
-            "fields": [],
-            "run_id": run_id,
-            "error": str(e)
-        }
+    distinct = {}
+    for candidate in answerable:
+        distinct.setdefault(str(candidate.normalized_value), []).append(candidate)
+
+    if len(distinct) == 1:
+        best = max(answerable, key=lambda c: c.confidence)
+        if len(answerable) > 1:
+            best.add_note(
+                f"Corroborated by {len(answerable)} independent readings within this layer."
+            )
+        return best
+
+    best = max(answerable, key=lambda c: c.confidence)
+    conflict = ExtractedField(
+        field_name=field_name,
+        document_id=best.document_id,
+        run_id=best.run_id,
+        document_layer=best.document_layer,
+        raw_value=best.raw_value,
+        evidence=best.evidence,
+        section=best.section,
+        pdf_page=best.pdf_page,
+        printed_page=best.printed_page,
+        locator_uri=best.locator_uri,
+        extraction_method="llm",
+        model_id=best.model_id,
+        prompt_version=best.prompt_version,
+        confidence=best.confidence,
+        status=models.CONFLICT,
+        review_status=models.EXCEPTION,
+        normalized_value=None,
+    )
+    conflict.add_note(
+        "Conflicting values found within the same layer; value withheld pending review."
+    )
+    for value, group in sorted(distinct.items()):
+        pages = ", ".join(str(c.pdf_page) for c in group if c.pdf_page)
+        conflict.add_note(f"Reading: {value!r} (PDF page {pages or 'unknown'})")
+    return conflict
+
+
+def extract_layer(
+    client,
+    ingestion: IngestionResult,
+    layer: DocumentLayer,
+    pdf_bytes: bytes,
+    specs: tuple[FieldSpec, ...],
+) -> LayerExtraction:
+    """Extract every applicable field from one document layer."""
+    result = LayerExtraction(layer_id=layer.qualified_id, layer_label=layer.label)
+
+    pages = layer.body_pages()
+    if not pages:
+        result.warnings.append(f"Layer {layer.qualified_id} has no body pages to extract from.")
+        return result
+
+    chunks = _chunk_pages(pages)
+    result.chunk_count = len(chunks)
+    if len(chunks) > 1:
+        result.warnings.append(
+            f"Layer {layer.qualified_id} spans {len(pages)} pages and was split "
+            f"into {len(chunks)} requests (API limit is {MAX_PAGES_PER_REQUEST} pages)."
+        )
+
+    schema = build_output_schema(specs)
+    per_chunk: list[list[ExtractedField]] = []
+
+    for index, page_map in enumerate(chunks):
+        prompt = build_user_prompt(
+            specs,
+            layer_label=f"{layer.label} ({layer.qualified_id})",
+            structure=ingestion.structure.structure,
+            page_range=(page_map[0], page_map[-1]),
+        )
+        response: ExtractionResponse = extract_structured(
+            client,
+            pdf_bytes=slice_pdf(pdf_bytes, page_map),
+            system_prompt=SYSTEM_PROMPT,
+            user_prompt=prompt,
+            output_schema=schema,
+        )
+        result.input_tokens += response.input_tokens
+        result.output_tokens += response.output_tokens
+        result.cache_read_tokens += response.cache_read_tokens
+        result.warnings.extend(response.warnings)
+
+        chunk_fields = []
+        for spec in specs:
+            payload = response.data.get(spec.name)
+            if not isinstance(payload, dict):
+                record = ExtractedField(
+                    field_name=spec.name,
+                    document_id=ingestion.document_id,
+                    run_id=ingestion.run_id,
+                    document_layer=layer.qualified_id,
+                    status=models.UNRESOLVED,
+                    review_status=models.EXCEPTION,
+                    model_id=MODEL_ID,
+                    prompt_version=PROMPT_VERSION,
+                )
+                record.add_note("Model omitted this field from its response.")
+                chunk_fields.append(record)
+                continue
+            record = _record_from_payload(spec.name, payload, ingestion, layer, page_map)
+            chunk_fields.append(_finalise(record, ingestion))
+        per_chunk.append(chunk_fields)
+
+    if len(per_chunk) == 1:
+        result.fields = per_chunk[0]
+    else:
+        by_name: dict[str, list[ExtractedField]] = {}
+        for chunk_fields in per_chunk:
+            for record in chunk_fields:
+                by_name.setdefault(record.field_name, []).append(record)
+        result.fields = [
+            reconcile_within_layer(candidates, name) for name, candidates in by_name.items()
+        ]
+
+    return result
+
+
+def extract_document(
+    client,
+    ingestion: IngestionResult,
+    pdf_bytes: bytes,
+    layer_ids: tuple[str, ...] = EXTRACTABLE_LAYERS,
+) -> ExtractionRun:
+    """
+    Extract structured fields from every extractable layer of one document.
+
+    Refuses to run when ingestion blocked the document: extracting around
+    pages we could not read yields a result that looks complete and is not.
+    """
+    run = ExtractionRun(
+        document_id=ingestion.document_id,
+        run_id=ingestion.run_id,
+        model_id=MODEL_ID,
+        prompt_version=PROMPT_VERSION,
+    )
+
+    if not ingestion.may_extract:
+        run.error = (
+            f"Extraction blocked: ingestion status is "
+            f"'{ingestion.integrity.ingestion_status}'. "
+            f"{len(ingestion.integrity.unreadable_pages)} page(s) require OCR."
+        )
+        return run
+
+    structure = ingestion.structure.structure
+    specs = fields_for(structure)
+
+    targets = [l for l in ingestion.layers if l.layer_id in layer_ids]
+    if not targets:
+        run.error = "No extractable layer was identified in this document."
+        return run
+
+    for layer in targets:
+        try:
+            extraction = extract_layer(client, ingestion, layer, pdf_bytes, specs)
+        except Exception as exc:
+            run.warnings.append(f"Layer {layer.qualified_id} failed: {exc}")
+            continue
+        run.layers.append(extraction)
+        run.fields.extend(extraction.fields)
+        run.warnings.extend(extraction.warnings)
+
+    # Fields that do not exist in this kind of transaction are recorded
+    # explicitly, once, so an export shows the complete field set and a reader
+    # can distinguish "absent" from "does not apply here".
+    for spec in inapplicable_fields(structure):
+        run.fields.append(
+            models.not_applicable_field(
+                spec.name, ingestion.document_id, ingestion.run_id, structure
+            )
+        )
+
+    if not run.layers:
+        run.error = "Extraction produced no results for any layer."
+
+    return run

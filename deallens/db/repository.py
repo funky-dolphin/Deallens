@@ -274,3 +274,165 @@ def get_page_text(conn: sqlite3.Connection, document_id: str, pdf_page: int) -> 
         (document_id, pdf_page),
     ).fetchone()
     return row["text"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Extracted fields (Workstream 2)
+# ---------------------------------------------------------------------------
+
+def save_extraction(conn: sqlite3.Connection, run) -> int:
+    """
+    Persist an ExtractionRun. Returns the number of field rows written.
+
+    Rows are keyed by (document, field, layer, run), so the same field
+    extracted from two layers is two rows. Re-running the same run_id replaces
+    that run's rows and leaves earlier runs intact, which is what makes a
+    before/after comparison across prompt versions possible.
+    """
+    written = 0
+    try:
+        with conn:
+            conn.execute(
+                "DELETE FROM extracted_fields WHERE document_id = ? AND run_id = ?",
+                (run.document_id, run.run_id),
+            )
+            conn.execute(
+                "DELETE FROM extraction_runs WHERE document_id = ? AND run_id = ?",
+                (run.document_id, run.run_id),
+            )
+
+            for layer in run.layers:
+                conn.execute(
+                    """
+                    INSERT INTO extraction_runs (
+                        document_id, layer_id, chunk_count, input_tokens,
+                        output_tokens, cache_read_tokens, model_id, prompt_version, run_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        run.document_id, layer.layer_id, layer.chunk_count,
+                        layer.input_tokens, layer.output_tokens, layer.cache_read_tokens,
+                        run.model_id, run.prompt_version, run.run_id,
+                    ),
+                )
+
+            for record in run.fields:
+                conn.execute(
+                    """
+                    INSERT INTO extracted_fields (
+                        document_id, field_name, category, document_layer,
+                        normalized_value, value_json, currency, raw_value,
+                        pdf_page, printed_page, section, evidence, locator_uri,
+                        extraction_method, confidence, status, review_status,
+                        normalization_status, evidence_verified, is_critical,
+                        notes, model_id, prompt_version, run_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        record.document_id,
+                        record.field_name,
+                        record.category,
+                        record.document_layer,
+                        # Stored twice on purpose: a display string, and a typed
+                        # JSON form so a float stays a float on the way out.
+                        None if record.normalized_value is None else str(record.normalized_value),
+                        json.dumps(record.normalized_value),
+                        record.currency,
+                        record.raw_value,
+                        record.pdf_page,
+                        record.printed_page,
+                        record.section,
+                        record.evidence,
+                        record.locator_uri,
+                        record.extraction_method,
+                        record.confidence,
+                        record.status,
+                        record.review_status,
+                        record.normalization_status,
+                        None if record.evidence_verified is None else int(record.evidence_verified),
+                        int(record.is_critical),
+                        json.dumps(record.notes),
+                        record.model_id,
+                        record.prompt_version,
+                        record.run_id,
+                    ),
+                )
+                written += 1
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"Failed to persist extraction for {run.document_id}: {exc}") from exc
+    return written
+
+
+def _hydrate_field(row: sqlite3.Row) -> dict:
+    record = dict(row)
+    record["notes"] = json.loads(record["notes"]) if record["notes"] else []
+    record["normalized_value"] = (
+        json.loads(record["value_json"]) if record["value_json"] is not None else None
+    )
+    record["evidence_verified"] = (
+        None if record["evidence_verified"] is None else bool(record["evidence_verified"])
+    )
+    record["is_critical"] = bool(record["is_critical"])
+    return record
+
+
+def get_extracted_fields(
+    conn: sqlite3.Connection,
+    document_id: str,
+    layer: str | None = None,
+    run_id: str | None = None,
+) -> list[dict]:
+    query = "SELECT * FROM extracted_fields WHERE document_id = ?"
+    params: list = [document_id]
+    if layer:
+        query += " AND document_layer = ?"
+        params.append(layer)
+    if run_id:
+        query += " AND run_id = ?"
+        params.append(run_id)
+    query += " ORDER BY category, field_name, document_layer"
+    return [_hydrate_field(row) for row in conn.execute(query, params)]
+
+
+def get_review_queue(conn: sqlite3.Connection, document_id: str) -> list[dict]:
+    """
+    Fields requiring human adjudication (Workstream 8).
+
+    Critical fields first, then conflicts, then everything else: the ordering
+    is the triage order an analyst would want.
+    """
+    rows = conn.execute(
+        """
+        SELECT * FROM extracted_fields
+        WHERE document_id = ? AND review_status = 'exception'
+        ORDER BY is_critical DESC,
+                 CASE status WHEN 'conflict' THEN 0 WHEN 'unresolved' THEN 1 ELSE 2 END,
+                 field_name
+        """,
+        (document_id,),
+    )
+    return [_hydrate_field(row) for row in rows]
+
+
+def set_review_status(
+    conn: sqlite3.Connection, field_row_id: int, review_status: str, note: str | None = None
+) -> None:
+    """Record a human review decision against a field."""
+    if review_status not in {"unreviewed", "verified", "exception"}:
+        raise ValueError(f"invalid review_status {review_status!r}")
+    with conn:
+        if note:
+            row = conn.execute(
+                "SELECT notes FROM extracted_fields WHERE id = ?", (field_row_id,)
+            ).fetchone()
+            notes = json.loads(row["notes"]) if row and row["notes"] else []
+            notes.append(f"Review: {note}")
+            conn.execute(
+                "UPDATE extracted_fields SET review_status = ?, notes = ? WHERE id = ?",
+                (review_status, json.dumps(notes), field_row_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE extracted_fields SET review_status = ? WHERE id = ?",
+                (review_status, field_row_id),
+            )

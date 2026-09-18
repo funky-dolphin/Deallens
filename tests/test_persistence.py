@@ -135,3 +135,89 @@ def test_failed_write_leaves_no_partial_document(conn):
     (layers,) = conn.execute("SELECT COUNT(*) FROM document_layers").fetchone()
     assert documents == 0
     assert layers == 0
+
+
+# ---------------------------------------------------------------------------
+# Extracted fields (Workstream 2)
+# ---------------------------------------------------------------------------
+
+def _extraction_run(document_id="doc_x", run_id="r1"):
+    from deallens.extraction.extractor import ExtractionRun, LayerExtraction
+    from deallens.extraction.models import ExtractedField, CONFLICT, EXCEPTION, FOUND
+
+    summary = ExtractedField(
+        field_name="consideration_per_share", document_id=document_id, run_id=run_id,
+        document_layer="filing-summary", normalized_value=73.0, currency="USD",
+        raw_value="$73.00", pdf_page=2, printed_page=None, section="Merger Consideration",
+        evidence="will be converted into the right to receive $73.00 in cash",
+        confidence=0.98, status=FOUND, evidence_verified=True,
+    )
+    agreement = ExtractedField(
+        field_name="consideration_per_share", document_id=document_id, run_id=run_id,
+        document_layer="agreement-ex2.1", normalized_value=73.0, currency="USD",
+        raw_value="$73.00", pdf_page=12, printed_page="3", section="Section 2.01",
+        evidence="the right to receive $73.00 in cash", confidence=0.99,
+        status=FOUND, evidence_verified=True,
+    )
+    conflicted = ExtractedField(
+        field_name="company_termination_fee", document_id=document_id, run_id=run_id,
+        document_layer="agreement-ex2.1", raw_value="$250,000,000", evidence="quote",
+        pdf_page=71, status=CONFLICT, review_status=EXCEPTION, confidence=0.8,
+    )
+    conflicted.add_note("Conflicting values found within the same layer.")
+
+    run = ExtractionRun(
+        document_id=document_id, run_id=run_id,
+        model_id="claude-opus-5", prompt_version="2.0.0",
+    )
+    run.layers = [LayerExtraction(layer_id="filing-summary", layer_label="Filing summary", input_tokens=10, output_tokens=5)]
+    run.fields = [summary, agreement, conflicted]
+    return run
+
+
+@requires_bio_techne
+def test_extracted_fields_round_trip(conn, bio_techne_ingested):
+    from deallens.db import get_extracted_fields, save_extraction
+
+    document_id = save_ingestion(conn, bio_techne_ingested)
+    run = _extraction_run(document_id, bio_techne_ingested.run_id)
+    assert save_extraction(conn, run) == 3
+
+    rows = get_extracted_fields(conn, document_id)
+    assert len(rows) == 3
+    per_share = [r for r in rows if r["field_name"] == "consideration_per_share"]
+    assert len(per_share) == 2, "both layers' readings must persist separately"
+    assert {r["document_layer"] for r in per_share} == {"filing-summary", "agreement-ex2.1"}
+    # Typed round-trip: a float must not come back as a string.
+    assert per_share[0]["normalized_value"] == 73.0
+    assert isinstance(per_share[0]["normalized_value"], float)
+
+
+@requires_bio_techne
+def test_review_queue_surfaces_conflicts_critical_first(conn, bio_techne_ingested):
+    from deallens.db import get_review_queue, save_extraction
+
+    document_id = save_ingestion(conn, bio_techne_ingested)
+    save_extraction(conn, _extraction_run(document_id, bio_techne_ingested.run_id))
+
+    queue = get_review_queue(conn, document_id)
+    assert len(queue) == 1
+    assert queue[0]["field_name"] == "company_termination_fee"
+    assert queue[0]["status"] == "conflict"
+    assert queue[0]["is_critical"] is True
+    assert queue[0]["notes"]
+
+
+@requires_bio_techne
+def test_review_decision_is_recorded(conn, bio_techne_ingested):
+    from deallens.db import get_review_queue, save_extraction, set_review_status
+
+    document_id = save_ingestion(conn, bio_techne_ingested)
+    save_extraction(conn, _extraction_run(document_id, bio_techne_ingested.run_id))
+    row_id = get_review_queue(conn, document_id)[0]["id"]
+
+    set_review_status(conn, row_id, "verified", note="Confirmed $250m against Section 7.02.")
+    assert get_review_queue(conn, document_id) == []
+    row = conn.execute("SELECT * FROM extracted_fields WHERE id = ?", (row_id,)).fetchone()
+    assert row["review_status"] == "verified"
+    assert "Confirmed $250m" in row["notes"]

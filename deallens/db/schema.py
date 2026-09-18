@@ -119,6 +119,59 @@ _STATEMENTS = (
         FOREIGN KEY (document_id) REFERENCES documents(document_id)
     )
     """,
+    # -- Extracted fields (Workstream 2) -------------------------------------
+    # One row per field PER LAYER. The same field extracted from the filing
+    # summary and from the agreement produces two rows, deliberately: the
+    # comparison between them is a deliverable, so collapsing them here would
+    # destroy it before Workstream 3 ever runs.
+    """
+    CREATE TABLE IF NOT EXISTS extracted_fields (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id          TEXT NOT NULL,
+        field_name           TEXT NOT NULL,
+        category             TEXT,
+        document_layer       TEXT,
+        normalized_value     TEXT,
+        value_json           TEXT,
+        currency             TEXT,
+        raw_value            TEXT,
+        pdf_page             INTEGER,
+        printed_page         TEXT,
+        section              TEXT,
+        evidence             TEXT,
+        locator_uri          TEXT,
+        extraction_method    TEXT NOT NULL,
+        confidence           REAL NOT NULL,
+        status               TEXT NOT NULL,
+        review_status        TEXT NOT NULL,
+        normalization_status TEXT,
+        evidence_verified    INTEGER,
+        is_critical          INTEGER NOT NULL DEFAULT 0,
+        notes                TEXT,
+        model_id             TEXT,
+        prompt_version       TEXT,
+        run_id               TEXT NOT NULL,
+        UNIQUE (document_id, field_name, document_layer, run_id),
+        FOREIGN KEY (document_id) REFERENCES documents(document_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_fields_lookup ON extracted_fields(document_id, field_name)",
+    "CREATE INDEX IF NOT EXISTS idx_fields_review ON extracted_fields(document_id, review_status)",
+    """
+    CREATE TABLE IF NOT EXISTS extraction_runs (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id     TEXT NOT NULL,
+        layer_id        TEXT NOT NULL,
+        chunk_count     INTEGER,
+        input_tokens    INTEGER,
+        output_tokens   INTEGER,
+        cache_read_tokens INTEGER,
+        model_id        TEXT,
+        prompt_version  TEXT,
+        run_id          TEXT NOT NULL,
+        FOREIGN KEY (document_id) REFERENCES documents(document_id)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS runs (
         run_id            TEXT PRIMARY KEY,
