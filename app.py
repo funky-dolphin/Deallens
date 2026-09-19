@@ -3,10 +3,13 @@ app.py
 DealLens -- Streamlit front end over the controlled ingestion and extraction
 pipeline.
 
-The page order mirrors the order the controls run in, and the free stages are
-deliberately separated from the paid one: a document is ingested, inspected
-and priced before any request is sent, and extraction only proceeds when an
-operator authorises it against a spend ceiling.
+The page order mirrors the order the controls run in. Ingestion and
+inspection are local and free; extraction is the one stage that calls the API,
+and it stays behind its own button on its own page rather than running as a
+side effect of uploading a file.
+
+The API key is read from the environment or Streamlit secrets, never typed
+into the page.
 """
 
 from __future__ import annotations
@@ -33,14 +36,18 @@ from deallens.db import (
     save_ingestion,
     set_review_status,
 )
-from deallens.extraction import MODEL_ID, PROMPT_VERSION, extract_document, fields_for
-from deallens.extraction.client import INPUT_USD_PER_MTOK, OUTPUT_USD_PER_MTOK
-from deallens.extraction.extractor import estimate_run
+from deallens.extraction import MODEL_ID, PROMPT_VERSION, extract_document
 from deallens.ingestion import ingest
 
 load_dotenv()
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+# Backstop against a pathological document -- one several times larger than
+# expected, or whose layers were mis-segmented so the whole filing landed in a
+# single layer. extract_document prices the run internally and refuses to start
+# above this. It is not shown in the UI; set it to None to remove the gate.
+MAX_COST_USD = 25.0
 
 st.set_page_config(page_title="DealLens", page_icon="🔍", layout="wide")
 
@@ -84,33 +91,20 @@ def _doc_picker(label: str = "Document") -> str | None:
     return options[st.selectbox(label, list(options.keys()))]
 
 
+api_key = _api_key()
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🔍 DealLens")
     st.caption("AI-assisted transaction & hedging intelligence")
     st.divider()
 
-    api_key = st.text_input(
-        "Anthropic API key",
-        type="password",
-        value=_api_key(),
-        help="Read from Streamlit secrets or .env if present. Never stored or logged.",
-    )
-    cost_ceiling = st.number_input(
-        "Spend ceiling per run (USD)",
-        min_value=0.50,
-        max_value=100.0,
-        value=8.0,
-        step=0.50,
-        help="Extraction refuses to start if the priced estimate exceeds this.",
-    )
-
-    st.divider()
     page = st.radio(
         "Navigation",
         [
             "1 · Ingest & inspect",
-            "2 · Price & extract",
+            "2 · Extract",
             "3 · Extracted fields",
             "4 · Review queue",
             "5 · Hedging analysis",
@@ -127,7 +121,7 @@ if page.startswith("1"):
     st.title("Ingest & inspect")
     st.caption(
         "Ingestion reads, classifies and integrity-checks the document locally. "
-        "No API request is sent and nothing is spent on this page."
+        "No API request is sent on this page."
     )
 
     samples = sorted(p.name for p in REPO_ROOT.glob("*.pdf"))
@@ -214,12 +208,12 @@ if page.startswith("1"):
             st.success("No integrity issues found.")
 
 
-# ── 2 · Price & extract ───────────────────────────────────────────────────────
+# ── 2 · Extract ───────────────────────────────────────────────────────────────
 elif page.startswith("2"):
-    st.title("Price & extract")
+    st.title("Extract")
     st.caption(
-        "The estimate below is computed locally and costs nothing. "
-        "Only the **Run extraction** button spends money."
+        "Sends the document to the Claude API, one request per layer, and stores "
+        "the extracted fields with their evidence."
     )
 
     live = st.session_state.ingestions
@@ -236,84 +230,44 @@ elif page.startswith("2"):
         ingestion = live[document_id]
         pdf_bytes = st.session_state.pdf_bytes[document_id]
 
-        specs = fields_for(ingestion.structure.structure)
-        estimate = estimate_run(ingestion, specs)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Applicable fields", len(specs))
-        c2.metric("Requests", estimate.requests)
-        c3.metric("Estimated cost", f"${estimate.cost_low:.2f}–${estimate.cost_high:.2f}")
-
-        if estimate.layers:
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "layer": l.layer_id,
-                            "pages": l.pages,
-                            "input tokens": f"{l.input_tokens:,}",
-                            "requests": l.requests,
-                            "cost": f"${l.cost_low:.2f}–${l.cost_high:.2f}",
-                        }
-                        for l in estimate.layers
-                    ]
-                ),
-                width="stretch",
-                hide_index=True,
-            )
-
         if not ingestion.may_extract:
             st.error(
                 f"Extraction is blocked: ingestion status is "
                 f"'{ingestion.integrity.ingestion_status}'. "
                 f"{len(ingestion.integrity.unreadable_pages)} page(s) require OCR."
             )
-        elif estimate.cost_high > cost_ceiling:
-            st.warning(
-                f"Estimated cost exceeds the ${cost_ceiling:.2f} ceiling set in the sidebar. "
-                "Raise the ceiling to authorise this run."
-            )
-
-        st.divider()
-        st.warning(
-            f"**This sends {estimate.requests} request(s) to the Claude API and will be billed "
-            f"to your key** — roughly ${estimate.cost_low:.2f}–${estimate.cost_high:.2f}."
-        )
 
         if st.button("Run extraction", type="primary", disabled=not ingestion.may_extract):
             if not api_key:
-                st.error("Enter an Anthropic API key in the sidebar.")
+                st.error(
+                    "No Anthropic API key found. Set `ANTHROPIC_API_KEY` in `.env`, "
+                    "or in Streamlit secrets when deployed."
+                )
             else:
-                spinner = f"Extracting {len(specs)} fields across {estimate.requests} request(s)…"
-                with st.spinner(spinner):
+                with st.spinner("Extracting…"):
                     run = extract_document(
                         _anthropic_client(api_key),
                         ingestion,
                         pdf_bytes,
-                        max_cost_usd=cost_ceiling,
+                        max_cost_usd=MAX_COST_USD,
                     )
 
                 if run.error:
                     st.error(run.error)
                 else:
                     save_extraction(conn, run)
-                    actual = (
-                        run.total_input_tokens * INPUT_USD_PER_MTOK
-                        + run.total_output_tokens * OUTPUT_USD_PER_MTOK
-                    ) / 1_000_000
                     counts = run.by_status()
                     st.success(
                         f"Extracted {len(run.fields)} fields from {len(run.layers)} layer(s) "
                         f"· run `{run.run_id}`"
                     )
-                    c1, c2, c3, c4 = st.columns(4)
+                    c1, c2, c3 = st.columns(3)
                     c1.metric("Found", counts.get("found", 0))
                     c2.metric("Not found", counts.get("not_found", 0))
                     c3.metric(
                         "Conflict / unresolved",
                         counts.get("conflict", 0) + counts.get("unresolved", 0),
                     )
-                    c4.metric("Actual cost", f"${actual:.2f}")
                     st.caption(
                         f"{run.total_input_tokens:,} input tokens "
                         f"({run.total_cache_read_tokens:,} read from cache) · "
@@ -334,7 +288,7 @@ elif page.startswith("3"):
     if document_id:
         rows = get_extracted_fields(conn, document_id)
         if not rows:
-            st.info("Nothing extracted for this document yet. See **Price & extract**.")
+            st.info("Nothing extracted for this document yet. See **Extract**.")
         else:
             show_empty = st.checkbox(
                 "Show fields that were not found or do not apply", value=False
@@ -486,7 +440,10 @@ elif page.startswith("6"):
 
         if st.button("Ask", type="primary"):
             if not api_key:
-                st.error("Enter an Anthropic API key in the sidebar.")
+                st.error(
+                    "No Anthropic API key found. Set `ANTHROPIC_API_KEY` in `.env`, "
+                    "or in Streamlit secrets when deployed."
+                )
             else:
                 rows = [
                     r
