@@ -8,17 +8,28 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 ## Workstreams
 
 ### WS1 — Document Ingestion ✅
-- File uploader in Streamlit (PDF only)
-- Optional source URL input
+- File uploader in Streamlit (PDF only), optional source URL
 - SHA-256 checksum for deduplication
+- Page inventory with per-page text, character counts and image detection
+- Layer segmentation: filing summary vs agreement exhibit vs governing documents
+- Transaction-structure classification (merger / tender offer / scheme …)
+- Page-integrity controls: duplicate, blank, sparse and unreadable pages;
+  printed-label reconciliation. Unreadable pages block extraction outright
 - Per-session in-memory SQLite database
 
 ### WS2 — LLM Extraction ✅
-- PDF sent as base64 to Claude API (no parsing library)
-- Structured JSON extraction of 25+ fields across 5 categories
-- Fields: transaction identity, timing, conditions, termination, financing
-- Confidence scores and evidence quotes per field
-- Model: claude-opus-4-5
+- Machine-readable filings extracted as text; only image-only pages fall back
+  to page images, which is what cut input cost 54%
+- Each layer queried separately so the summary and the agreement can be
+  compared in WS3 rather than blended
+- 50 fields across 6 categories, narrowed per transaction structure
+- Requests sized against the token budget; the schema is re-sent per request,
+  so chunking is avoided rather than merely tolerated
+- Fail-closed controls: a value is asserted only when it normalizes cleanly,
+  its evidence quote is found on the page it cites, and confidence clears the
+  threshold (higher for critical fields). Everything else routes to review
+- Spend is estimated and gated before the first request
+- Model: claude-opus-5
 
 ### WS3 — Field Comparison (Partial)
 - Compare 8-K filing summary vs full merger agreement
@@ -85,10 +96,34 @@ Note: On Streamlit Cloud the in-memory SQLite resets on each browser session —
 
 ---
 
+## Repository layout
+
+```
+app.py                      Streamlit UI: ingest → price → extract → review
+deallens/
+  ingestion/                WS1
+    loader.py               PDF → page inventory, checksum, text layer
+    classifier.py           layer segmentation + structure classification
+    integrity.py            page-integrity controls, printed-label reconciliation
+    locators.py             source locators, evidence verification
+    pipeline.py             ingest(): the one entry point
+  extraction/               WS2
+    registry.py             the 50 field specs and what they apply to
+    prompts.py              system prompt + per-layer user prompt + output schema
+    client.py               Claude call, token budget, pricing constants
+    normalize.py            money/date/percent normalization
+    models.py               ExtractedField + the fail-closed rules
+    extractor.py            estimate_run(), extract_layer(), extract_document()
+  analytics/hedging.py      WS5 DV01 and scenario matrix
+  db/                       schema + repository (the audit record)
+scripts/estimate_cost.py    price a run from the CLI, offline
+tests/                      91 tests
+```
+
 ## Key Decisions
 
 - **SQLite in-memory over ChromaDB/Pinecone**: Simpler, no persistence issues on Streamlit Cloud, sufficient for structured field Q&A
-- **Direct PDF base64 to Claude API**: No pdfplumber/PyMuPDF dependency, Claude handles PDF parsing internally
+- **Text over page images where the filing allows it**: the original design sent the whole PDF as base64. Sending extracted text for machine-readable filings, and reserving page images for pages that genuinely need them, cut extraction input from 290,717 to 133,128 tokens for the same document
 - **Per-session DB in st.session_state**: Isolates users, no cross-contamination
 - **Synthetic assumptions clearly labeled**: All hedging inputs flagged as synthetic unless extracted from document
 

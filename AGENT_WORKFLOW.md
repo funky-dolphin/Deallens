@@ -32,6 +32,13 @@ Files created:
 - `hedging.py` — DV01 calculations and scenario runner
 - `app.py` — Streamlit UI with 4 pages
 
+### Session 3 — WS1/WS2 rebuild
+The four scaffolding modules above were replaced by the `deallens` package;
+`database.py`, `extractor.py` and `hedging.py` no longer exist as top-level
+modules. See **Repository layout** in `EXECUTION_PLAN.md` for what replaced
+them. `app.py` was rewired onto the package and gained the pricing and
+review pages the new controls made possible.
+
 ---
 
 ## Extraction Prompt Design
@@ -73,14 +80,20 @@ P&L formula: `-DV01 × rate_shift_bps`
 - [ ] WS3: Filing summary vs agreement comparison view not yet built
 - [ ] WS4: Transaction timeline visualization not yet built
 - [ ] WS7: Hedging assumptions not yet adapted for Organon and Uber deals
-- [ ] End-to-end test with actual Bio-Techne PDF not yet run
+- [ ] Live extraction against the Bio-Techne 8-K not yet run. Ingestion runs
+      end to end on it (99 pages, 3 layers, `merger` at 1.00 confidence) and
+      the run prices at $1.70-$2.95; the paid call is the step still outstanding
 - [ ] Streamlit Cloud deployment not yet done
 
 ---
 
 ## Error Recovery Patterns
 
-**JSON parse failure**: `extractor.py` catches `json.JSONDecodeError` and returns `error` string. App shows `st.error()` to user. No partial data is written to DB.
+**Malformed or omitted field**: the model is held to an output schema, so a
+missing field is detected per field rather than per response. `extractor.py`
+records it as `unresolved` and routes it to review; the rest of the layer is
+kept. A layer that fails outright is recorded as a warning on the run and the
+remaining layers still extract.
 
 **API failure**: Caught by generic `except Exception` in extractor. Error bubbled to UI.
 
