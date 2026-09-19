@@ -71,12 +71,26 @@ st.set_page_config(page_title="DealLens", page_icon="🔍", layout="wide")
 # file would be one database shared by every visitor.
 DB_PATH = os.getenv("DEALLENS_DB") or ":memory:"
 
+# The connection is keyed on the path, not merely created once. Setting
+# DEALLENS_DB while the app is already running changes DB_PATH on the next
+# rerun but leaves an existing session holding its original connection, so
+# writes would keep going to the in-memory database this setting was meant to
+# replace -- while the sidebar, reading DB_PATH directly, reported the file.
+# Storage that silently disagrees with what the UI claims is worse than no
+# setting at all.
+#
 # The IngestionResult objects are held in session state whichever mode is in
 # use: the database records what ingestion found, but extraction needs the
-# live object (page text, layer boundaries) and the original bytes. Those are
-# cheap to rebuild -- re-ingesting is local and free.
-if "db" not in st.session_state:
+# live object (page text, layer boundaries) and the original bytes. They are
+# dropped when the database changes underneath them, because they describe
+# documents the new database may know nothing about. Re-ingesting is local
+# and free.
+if st.session_state.get("db_path") != DB_PATH:
+    previous = st.session_state.get("db")
+    if previous is not None:
+        previous.close()
     st.session_state.db = initialize_schema(get_connection(DB_PATH))
+    st.session_state.db_path = DB_PATH
     st.session_state.ingestions = {}
     st.session_state.pdf_bytes = {}
 
