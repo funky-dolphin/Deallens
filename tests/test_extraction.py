@@ -33,11 +33,18 @@ class FakeClient:
     it. Fields absent from the map are reported as not found. `per_call` lets
     a test vary the response between calls, which is how chunk conflicts and
     layer differences are simulated.
+
+    `omit` drops fields from the response entirely and `duplicates` returns a
+    field more than once. Neither is reachable through the schema -- a list
+    response cannot be constrained to one record per field -- so both are
+    failure modes the extractor has to handle itself.
     """
 
-    def __init__(self, payloads=None, per_call=None):
+    def __init__(self, payloads=None, per_call=None, omit=(), duplicates=None):
         self.payloads = payloads or {}
         self.per_call = list(per_call) if per_call else None
+        self.omit = set(omit)
+        self.duplicates = duplicates or {}
         self.calls = 0
         self.prompts = []
 
@@ -62,15 +69,19 @@ class FakeClient:
             def get_final_message(self):
                 import json
 
+                from deallens.extraction.prompts import schema_field_names
+
                 schema = self.kwargs["output_config"]["format"]["schema"]
                 source = (
                     outer.per_call[min(outer.calls - 1, len(outer.per_call) - 1)]
                     if outer.per_call
                     else outer.payloads
                 )
-                data = {}
-                for name in schema["required"]:
-                    data[name] = source.get(
+                records = []
+                for name in schema_field_names(schema):
+                    if name in outer.omit:
+                        continue
+                    payload = source.get(
                         name,
                         {
                             "found": False,
@@ -81,7 +92,10 @@ class FakeClient:
                             "confidence": 0.0,
                         },
                     )
-                return _Message(json.dumps(data))
+                    records.append({"field_name": name, **payload})
+                    for extra in outer.duplicates.get(name, []):
+                        records.append({"field_name": name, **extra})
+                return _Message(json.dumps({"fields": records}))
 
         class _Message:
             def __init__(self, text):
@@ -370,6 +384,126 @@ def test_validation_accepts_a_well_formed_record():
     assert validate(record) == []
 
 
+def test_output_schema_is_a_list_the_grammar_compiler_will_accept():
+    """
+    A structured-output schema is compiled into a grammar, and an object of
+    required properties exceeds the size limit somewhere between 8 and 12 of
+    them. This schema covers 48 fields, so it has to be a list of records with
+    the field name carried in an enum. A regression to named properties would
+    pass every offline test and fail as a 400 on the first real extraction.
+    """
+    from deallens.extraction.prompts import build_output_schema, schema_field_names
+
+    specs = fields_for("merger")
+    schema = build_output_schema(specs)
+
+    assert list(schema["properties"]) == ["fields"], "one array, not a property per field"
+    assert schema["properties"]["fields"]["type"] == "array"
+    assert schema_field_names(schema) == [spec.name for spec in specs]
+
+    record = schema["properties"]["fields"]["items"]
+    assert record["additionalProperties"] is False
+    assert set(record["required"]) == {
+        "field_name", "found", "raw_value", "page", "section", "evidence", "confidence",
+    }
+
+
+def test_every_field_definition_reaches_the_prompt():
+    """
+    Descriptions, enum values and guidance used to live in the schema. They
+    moved into the prompt when the schema became a list of identical records,
+    and a field whose definition did not make the journey would be extracted
+    from its name alone.
+    """
+    from deallens.extraction.prompts import build_user_prompt
+
+    specs = fields_for("merger")
+    prompt = build_user_prompt(specs, layer_label="agreement", structure="merger")
+
+    for spec in specs:
+        assert spec.name in prompt
+        assert spec.description in prompt
+        if spec.guidance:
+            assert spec.guidance in prompt
+        if spec.enum_values:
+            assert ", ".join(spec.enum_values) in prompt
+    assert str(len(specs)) in prompt, "the model is told how many records to return"
+
+
+def test_field_the_model_leaves_out_is_reported_unresolved(ingested, composite_pdf):
+    """
+    A list response cannot be constrained to one record per field, so the
+    completeness check the schema used to enforce now lives in the extractor.
+    A dropped field must surface as an exception rather than pass for a
+    not_found -- an oversight and a finding are not the same answer.
+    """
+    client = FakeClient(omit={"company_termination_fee"})
+    result = extract_layer(
+        client, ingested, ingested.agreement_layer, composite_pdf, fields_for("merger")
+    )
+
+    assert len(result.fields) == len(fields_for("merger")), "the field set is still complete"
+    fee = next(f for f in result.fields if f.field_name == "company_termination_fee")
+    assert fee.status == models.UNRESOLVED
+    assert fee.review_status == models.EXCEPTION
+    assert any("omitted" in note for note in fee.notes)
+
+
+def test_duplicate_records_for_one_field_are_reconciled_not_picked(ingested, composite_pdf):
+    """
+    Nothing in the schema stops the model answering the same field twice.
+    Two disagreeing answers are a conflict for review, not an invitation to
+    keep whichever arrived first.
+    """
+    agreement = ingested.agreement_layer
+    excerpt_page = agreement.body_pages().index(5) + 1
+    client = FakeClient(
+        {"company_termination_fee": _found("$250,000,000", excerpt_page, EVIDENCE)},
+        duplicates={
+            "company_termination_fee": [
+                _found("$99,000,000", excerpt_page, EVIDENCE, confidence=0.99)
+            ]
+        },
+    )
+    result = extract_layer(client, ingested, agreement, composite_pdf, fields_for("merger"))
+    fee = next(f for f in result.fields if f.field_name == "company_termination_fee")
+
+    assert fee.status == models.CONFLICT
+    assert fee.review_status == models.EXCEPTION
+    assert fee.normalized_value is None, "a conflicted value is withheld, not resolved"
+    assert any("2 records" in note for note in fee.notes)
+
+
+def test_records_for_unrequested_fields_are_ignored_and_reported(ingested, composite_pdf):
+    """
+    The enum should make an unknown field name impossible. If one arrives
+    anyway the schema is not doing what we believe it is, so the record is
+    dropped and the discrepancy is said out loud.
+    """
+    from deallens.extraction.extractor import _payloads_by_field
+
+    warnings: list[str] = []
+    payloads = _payloads_by_field(
+        {"fields": [
+            {"field_name": "target", "found": False},
+            {"field_name": "not_a_real_field", "found": True},
+        ]},
+        fields_for("merger"),
+        warnings,
+    )
+
+    assert set(payloads) == {"target"}
+    assert any("outside the requested set" in w for w in warnings)
+
+
+def test_a_response_with_no_fields_list_is_not_silently_empty():
+    from deallens.extraction.extractor import _payloads_by_field
+
+    warnings: list[str] = []
+    assert _payloads_by_field({}, fields_for("merger"), warnings) == {}
+    assert any("no 'fields' list" in w for w in warnings)
+
+
 def test_required_output_schema_matches_the_assignment():
     record = ExtractedField(
         field_name="consideration_per_share", document_id="bio_techne", run_id="run-1",
@@ -484,11 +618,11 @@ def test_chunking_is_driven_by_token_budget():
     agreement = ing.agreement_layer
     body = agreement.body_pages()
 
-    one_chunk, _ = _chunk_pages(ing, body, schema_tokens=6_000)
+    one_chunk, _ = _chunk_pages(ing, body, overhead_tokens=6_000)
     assert len(one_chunk) == 1
 
     # Force a tiny budget by claiming an enormous schema.
-    many, _ = _chunk_pages(ing, body, schema_tokens=999_000)
+    many, _ = _chunk_pages(ing, body, overhead_tokens=999_000)
     assert len(many) > 1
     assert [p for chunk in many for p in chunk] == body, "no page may be dropped or duplicated"
 
@@ -498,7 +632,7 @@ def test_oversized_single_page_is_reported_not_silently_truncated():
 
     pages = [exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")] + agreement_pages(body_pages=3)
     ing = ingest(make_pdf(pages), "x.pdf", run_id="r")
-    chunks, warnings = _chunk_pages(ing, ing.agreement_layer.body_pages(), schema_tokens=999_950)
+    chunks, warnings = _chunk_pages(ing, ing.agreement_layer.body_pages(), overhead_tokens=999_950)
     assert any("above the" in w and "request budget" in w for w in warnings)
 
 
@@ -506,15 +640,20 @@ def test_oversized_single_page_is_reported_not_silently_truncated():
 def test_offline_estimate_tracks_the_measured_token_count():
     """
     The pre-flight estimate gates real spend, so it must not understate.
-    Measured against the API's own count for the development filing
-    (133,128 tokens): the estimate should be close, and high rather than low.
+    Measured against the API's own count_tokens for the development filing:
+    the estimate should be close, and high rather than low.
+
+    Re-measure this figure whenever the schema or prompt changes size -- it is
+    a property of prompt version 3.0.0, not a constant. The 133,128 it held
+    previously was the 2.1.0 request, whose per-field schema descriptions cost
+    more than the field catalogue that replaced them.
     """
     from deallens.extraction.extractor import estimate_run
     from deallens.ingestion import ingest as _ingest
 
     ing = _ingest(open("8k bio-techne.pdf", "rb").read(), "b.pdf", run_id="r")
     estimated = estimate_run(ing).input_tokens
-    measured = 133_128
+    measured = 127_356
     assert estimated >= measured, "an estimate that understates cannot guard spend"
     assert estimated / measured < 1.20, f"estimate {estimated:,} is more than 20% above measured"
 

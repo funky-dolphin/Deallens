@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -40,8 +39,6 @@ from deallens.extraction import MODEL_ID, PROMPT_VERSION, extract_document
 from deallens.ingestion import ingest
 
 load_dotenv()
-
-REPO_ROOT = Path(__file__).resolve().parent
 
 # Backstop against a pathological document -- one several times larger than
 # expected, or whose layers were mis-segmented so the whole filing landed in a
@@ -124,20 +121,11 @@ if page.startswith("1"):
         "No API request is sent on this page."
     )
 
-    samples = sorted(p.name for p in REPO_ROOT.glob("*.pdf"))
-    source = st.radio("Source", ["Upload a PDF", "Use a PDF in the repo"], horizontal=True)
-
     pdf_bytes: bytes | None = None
     filename: str | None = None
-    if source == "Upload a PDF":
-        uploaded = st.file_uploader("Choose a PDF", type=["pdf"])
-        if uploaded:
-            pdf_bytes, filename = uploaded.read(), uploaded.name
-    elif samples:
-        choice = st.selectbox("File", samples)
-        pdf_bytes, filename = (REPO_ROOT / choice).read_bytes(), choice
-    else:
-        st.info("No PDFs found in the repository root.")
+    uploaded = st.file_uploader("Choose a PDF", type=["pdf"])
+    if uploaded:
+        pdf_bytes, filename = uploaded.read(), uploaded.name
 
     source_url = st.text_input("Source URL (optional)", placeholder="https://www.sec.gov/...")
 

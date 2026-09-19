@@ -44,8 +44,9 @@ review pages the new controls made possible.
 ## Extraction Prompt Design
 
 The extraction prompt was designed to:
-1. Hold the model to an **output schema** keyed by field name, so an omitted
-   field is detected per field rather than corrupting the whole response
+1. Hold the model to an **output schema** — a list of records, each naming its
+   field from a fixed enum, so an omitted or invented field is detected per
+   field rather than corrupting the whole response
 2. Require **evidence quotes** for every field — these are verified against the
    page they cite, so a quote that is not there withholds the value
 3. Require **page numbers** — critical for analyst verification
@@ -57,6 +58,15 @@ The extraction prompt was designed to:
 
 The prompt is versioned (`PROMPT_VERSION`) and stamped on every extracted row,
 so a result can be tied to the logic that produced it.
+
+The list shape is forced on us rather than chosen. A structured-output schema
+is compiled into a grammar, and an object with one required property per field
+exceeds the API's grammar size limit between 8 and 12 properties — measured,
+not inferred. With 48 fields in play the object form returns
+`The compiled grammar is too large`, and neither grouping the fields under
+category objects nor hoisting the repeated shape into `$defs` avoids it. Worth
+knowing before anyone tries to key the schema by field name again; see the
+module docstring in `prompts.py`.
 
 ---
 
@@ -96,11 +106,14 @@ P&L formula: `-DV01 × rate_shift_bps`
 
 ## Error Recovery Patterns
 
-**Malformed or omitted field**: the model is held to an output schema, so a
-missing field is detected per field rather than per response. `extractor.py`
-records it as `unresolved` and routes it to review; the rest of the layer is
-kept. A layer that fails outright is recorded as a warning on the run and the
-remaining layers still extract.
+**Malformed or omitted field**: the schema fixes each record's shape and the
+set of names a record may claim, and `extractor.py` checks that a record
+arrived for every requested field — so a missing field is detected per field
+rather than per response. It is recorded as `unresolved` and routed to review;
+the rest of the layer is kept. A field answered twice is reconciled as
+competing readings rather than resolved by arrival order. A layer that fails
+outright is recorded as a warning on the run and the remaining layers still
+extract.
 
 **API failure**: Caught by generic `except Exception` in extractor. Error bubbled to UI.
 

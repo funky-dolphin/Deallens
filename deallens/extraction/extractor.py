@@ -167,7 +167,7 @@ class ExtractionRun:
 
 
 def _chunk_pages(
-    ingestion: IngestionResult, pages: list[int], schema_tokens: int
+    ingestion: IngestionResult, pages: list[int], overhead_tokens: int
 ) -> tuple[list[list[int]], list[str]]:
     """
     Split a layer's pages into requests that fit the model's context.
@@ -178,12 +178,16 @@ def _chunk_pages(
     120,000 tokens or 600,000. In PDF mode a hard 600-page API limit also
     applies and is enforced alongside the token budget.
 
-    Fewer chunks is strictly better -- the schema is re-sent with each one --
-    so pages are packed greedily up to the budget.
+    `overhead_tokens` is what each request spends on the schema and the
+    prompt before any document text: it comes off the budget because the
+    pages have to fit alongside it, not instead of it.
+
+    Fewer chunks is strictly better -- that overhead is re-sent with each one
+    -- so pages are packed greedily up to the budget.
     """
     warnings: list[str] = []
     text_mode = ingestion.inventory.is_machine_readable
-    budget = max_input_tokens(schema_tokens)
+    budget = max_input_tokens(overhead_tokens)
     page_limit = len(pages) if text_mode else MAX_PAGES_PER_PDF_REQUEST
 
     chunks: list[list[int]] = []
@@ -209,6 +213,48 @@ def _chunk_pages(
     if current:
         chunks.append(current)
     return (chunks or [[]]), warnings
+
+
+def _payloads_by_field(
+    data: dict, specs: tuple[FieldSpec, ...], warnings: list[str]
+) -> dict[str, list[dict]]:
+    """
+    Index one response's records by the field each claims to answer.
+
+    The schema guarantees the shape of a record and the spelling of its name,
+    but it cannot require one record per field -- see the note in `prompts.py`.
+    Completeness is therefore checked here: a field with no record is reported
+    by the caller as unresolved, and a field with several is reconciled rather
+    than having one reading silently win.
+    """
+    entries = data.get("fields")
+    if not isinstance(entries, list):
+        warnings.append(
+            "Model response had no 'fields' list; every field in this request "
+            "is reported unresolved."
+        )
+        return {}
+
+    known = {spec.name for spec in specs}
+    by_name: dict[str, list[dict]] = {}
+    unknown: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("field_name")
+        if name not in known:
+            unknown.append(str(name))
+            continue
+        by_name.setdefault(name, []).append(entry)
+
+    if unknown:
+        # The enum should make this impossible. If it happens anyway, the
+        # schema is not doing what we think it is, and that is worth saying.
+        warnings.append(
+            f"Model returned {len(unknown)} record(s) for field name(s) outside "
+            f"the requested set ({', '.join(sorted(set(unknown))[:5])}); ignored."
+        )
+    return by_name
 
 
 def _record_from_payload(
@@ -358,21 +404,34 @@ def estimate_run(
     -- page inventory, character counts, layer boundaries -- is already known
     from ingestion, so the estimate is free and can gate the run.
 
-    The schema is counted once per request, not once per run: it is re-sent
-    with every call, so a layer split across three chunks pays for it three
-    times. That is also why chunking is something to avoid, not merely
-    tolerate.
+    The schema and prompt are counted once per request, not once per run: both
+    are re-sent with every call, so a layer split across three chunks pays for
+    them three times. That is also why chunking is something to avoid, not
+    merely tolerate.
+
+    The prompt is measured rather than guessed at, because the field catalogue
+    inside it is the larger half of the per-request overhead.
     """
     specs = specs if specs is not None else fields_for(ingestion.structure.structure)
     schema_tokens = estimate_tokens(len(json.dumps(build_output_schema(specs))))
-    prompt_tokens = estimate_tokens(len(SYSTEM_PROMPT) + 1_000)
 
     estimate = RunEstimate()
     for layer in [l for l in ingestion.layers if l.layer_id in layer_ids]:
         pages = layer.body_pages()
         if not pages:
             continue
-        chunks, _ = _chunk_pages(ingestion, pages, schema_tokens)
+        prompt_tokens = estimate_tokens(
+            len(SYSTEM_PROMPT)
+            + len(
+                build_user_prompt(
+                    specs,
+                    layer_label=f"{layer.label} ({layer.qualified_id})",
+                    structure=ingestion.structure.structure,
+                    page_range=(pages[0], pages[-1]),
+                )
+            )
+        )
+        chunks, _ = _chunk_pages(ingestion, pages, schema_tokens + prompt_tokens)
         content_tokens = estimate_tokens(
             sum(ingestion.inventory.page(p).char_count for p in pages)
         )
@@ -403,8 +462,19 @@ def extract_layer(
         return result
 
     schema = build_output_schema(specs)
-    schema_tokens = estimate_tokens(len(json.dumps(schema)))
-    chunks, chunk_warnings = _chunk_pages(ingestion, pages, schema_tokens)
+    overhead_tokens = estimate_tokens(
+        len(json.dumps(schema))
+        + len(SYSTEM_PROMPT)
+        + len(
+            build_user_prompt(
+                specs,
+                layer_label=f"{layer.label} ({layer.qualified_id})",
+                structure=ingestion.structure.structure,
+                page_range=(pages[0], pages[-1]),
+            )
+        )
+    )
+    chunks, chunk_warnings = _chunk_pages(ingestion, pages, overhead_tokens)
     result.chunk_count = len(chunks)
     result.warnings.extend(chunk_warnings)
     if len(chunks) > 1:
@@ -450,10 +520,11 @@ def extract_layer(
         result.cache_read_tokens += response.cache_read_tokens
         result.warnings.extend(response.warnings)
 
+        payloads = _payloads_by_field(response.data, specs, result.warnings)
         chunk_fields = []
         for spec in specs:
-            payload = response.data.get(spec.name)
-            if not isinstance(payload, dict):
+            entries = payloads.get(spec.name, [])
+            if not entries:
                 record = ExtractedField(
                     field_name=spec.name,
                     document_id=ingestion.document_id,
@@ -467,8 +538,25 @@ def extract_layer(
                 record.add_note("Model omitted this field from its response.")
                 chunk_fields.append(record)
                 continue
-            record = _record_from_payload(spec.name, payload, ingestion, layer, page_map)
-            chunk_fields.append(_finalise(record, ingestion))
+
+            readings = [
+                _finalise(
+                    _record_from_payload(spec.name, entry, ingestion, layer, page_map),
+                    ingestion,
+                )
+                for entry in entries
+            ]
+            if len(readings) == 1:
+                chunk_fields.append(readings[0])
+                continue
+            # The model answered the same field more than once. Treat the
+            # answers as competing readings rather than picking one: agreement
+            # is corroboration, disagreement goes to review.
+            merged = reconcile_within_layer(readings, spec.name)
+            merged.add_note(
+                f"Model returned {len(readings)} records for this field in one response."
+            )
+            chunk_fields.append(merged)
         per_chunk.append(chunk_fields)
 
     if len(per_chunk) == 1:
