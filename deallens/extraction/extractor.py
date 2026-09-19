@@ -22,7 +22,7 @@ conflicts rather than silently resolved.
 
 from __future__ import annotations
 
-import uuid
+import json
 from dataclasses import dataclass, field
 
 from ..ingestion.classifier import DocumentLayer
@@ -30,11 +30,16 @@ from ..ingestion.locators import compute_anchor, verify_evidence
 from ..ingestion.pipeline import IngestionResult
 from . import models
 from .client import (
-    MAX_PAGES_PER_REQUEST,
+    CHARS_PER_TOKEN,
+    INPUT_USD_PER_MTOK,
+    MAX_PAGES_PER_PDF_REQUEST,
     MODEL_ID,
+    OUTPUT_USD_PER_MTOK,
     ExtractionResponse,
     build_text_content,
+    estimate_tokens,
     extract_structured,
+    max_input_tokens,
     slice_pdf,
 )
 from .models import ExtractedField
@@ -45,8 +50,10 @@ from .registry import FieldSpec, fields_for, inapplicable_fields
 # documents and press releases are not sources of deal terms.
 EXTRACTABLE_LAYERS = ("filing-summary", "agreement")
 
-# Leave headroom under the hard API limit so a chunk boundary never lands on it.
-PAGES_PER_CHUNK = 400
+# Rough output cost per request: 48 fields with evidence quotes, plus adaptive
+# thinking at high effort. Used only for the pre-flight estimate.
+OUTPUT_TOKENS_PER_REQUEST_LOW = 20_000
+OUTPUT_TOKENS_PER_REQUEST_HIGH = 45_000
 
 
 @dataclass
@@ -68,6 +75,65 @@ class LayerExtraction:
 
 
 @dataclass
+class LayerEstimate:
+    """Pre-flight size and cost estimate for one layer."""
+
+    layer_id: str
+    pages: int
+    input_tokens: int
+    requests: int
+
+    @property
+    def cost_low(self) -> float:
+        return (
+            self.input_tokens * INPUT_USD_PER_MTOK
+            + self.requests * OUTPUT_TOKENS_PER_REQUEST_LOW * OUTPUT_USD_PER_MTOK
+        ) / 1_000_000
+
+    @property
+    def cost_high(self) -> float:
+        return (
+            self.input_tokens * INPUT_USD_PER_MTOK
+            + self.requests * OUTPUT_TOKENS_PER_REQUEST_HIGH * OUTPUT_USD_PER_MTOK
+        ) / 1_000_000
+
+
+@dataclass
+class RunEstimate:
+    """What a run is expected to cost, before any of it is spent."""
+
+    layers: list[LayerEstimate] = field(default_factory=list)
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(l.input_tokens for l in self.layers)
+
+    @property
+    def requests(self) -> int:
+        return sum(l.requests for l in self.layers)
+
+    @property
+    def cost_low(self) -> float:
+        return sum(l.cost_low for l in self.layers)
+
+    @property
+    def cost_high(self) -> float:
+        return sum(l.cost_high for l in self.layers)
+
+    def describe(self) -> str:
+        parts = [
+            f"{l.layer_id}: {l.pages} pages, ~{l.input_tokens:,} tokens, "
+            f"{l.requests} request(s)"
+            for l in self.layers
+        ]
+        return (
+            "; ".join(parts)
+            + f" | total ~{self.input_tokens:,} input tokens across "
+            f"{self.requests} request(s), ${self.cost_low:.2f}-${self.cost_high:.2f}"
+        )
+
+
+@dataclass
 class ExtractionRun:
     """Complete extraction across every extractable layer of one document."""
 
@@ -78,6 +144,7 @@ class ExtractionRun:
     layers: list[LayerExtraction] = field(default_factory=list)
     fields: list[ExtractedField] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    estimate: "RunEstimate | None" = None
     error: str | None = None
 
     @property
@@ -99,8 +166,49 @@ class ExtractionRun:
         return counts
 
 
-def _chunk_pages(pages: list[int], size: int = PAGES_PER_CHUNK) -> list[list[int]]:
-    return [pages[start : start + size] for start in range(0, len(pages), size)]
+def _chunk_pages(
+    ingestion: IngestionResult, pages: list[int], schema_tokens: int
+) -> tuple[list[list[int]], list[str]]:
+    """
+    Split a layer's pages into requests that fit the model's context.
+
+    Chunking is by estimated token count, not page count. Page size varies by
+    more than 20x within a single filing, so a page-count threshold
+    corresponds to no fixed quantity of content: the same "400 pages" may be
+    120,000 tokens or 600,000. In PDF mode a hard 600-page API limit also
+    applies and is enforced alongside the token budget.
+
+    Fewer chunks is strictly better -- the schema is re-sent with each one --
+    so pages are packed greedily up to the budget.
+    """
+    warnings: list[str] = []
+    text_mode = ingestion.inventory.is_machine_readable
+    budget = max_input_tokens(schema_tokens)
+    page_limit = len(pages) if text_mode else MAX_PAGES_PER_PDF_REQUEST
+
+    chunks: list[list[int]] = []
+    current: list[int] = []
+    current_tokens = 0
+
+    for page in pages:
+        page_tokens = estimate_tokens(ingestion.inventory.page(page).char_count)
+        if page_tokens > budget:
+            warnings.append(
+                f"PDF page {page} alone is an estimated {page_tokens:,} tokens, "
+                f"above the {budget:,}-token request budget. Sent as its own "
+                "request; the response may be truncated."
+            )
+        over_budget = current and current_tokens + page_tokens > budget
+        over_pages = current and len(current) >= page_limit
+        if over_budget or over_pages:
+            chunks.append(current)
+            current, current_tokens = [], 0
+        current.append(page)
+        current_tokens += page_tokens
+
+    if current:
+        chunks.append(current)
+    return (chunks or [[]]), warnings
 
 
 def _record_from_payload(
@@ -238,6 +346,47 @@ def reconcile_within_layer(
     return conflict
 
 
+def estimate_run(
+    ingestion: IngestionResult,
+    specs: tuple[FieldSpec, ...] | None = None,
+    layer_ids: tuple[str, ...] = EXTRACTABLE_LAYERS,
+) -> RunEstimate:
+    """
+    Size and price a run without making any API call.
+
+    Exists so spend is a decision rather than a surprise. Everything it needs
+    -- page inventory, character counts, layer boundaries -- is already known
+    from ingestion, so the estimate is free and can gate the run.
+
+    The schema is counted once per request, not once per run: it is re-sent
+    with every call, so a layer split across three chunks pays for it three
+    times. That is also why chunking is something to avoid, not merely
+    tolerate.
+    """
+    specs = specs if specs is not None else fields_for(ingestion.structure.structure)
+    schema_tokens = estimate_tokens(len(json.dumps(build_output_schema(specs))))
+    prompt_tokens = estimate_tokens(len(SYSTEM_PROMPT) + 1_000)
+
+    estimate = RunEstimate()
+    for layer in [l for l in ingestion.layers if l.layer_id in layer_ids]:
+        pages = layer.body_pages()
+        if not pages:
+            continue
+        chunks, _ = _chunk_pages(ingestion, pages, schema_tokens)
+        content_tokens = estimate_tokens(
+            sum(ingestion.inventory.page(p).char_count for p in pages)
+        )
+        estimate.layers.append(
+            LayerEstimate(
+                layer_id=layer.qualified_id,
+                pages=len(pages),
+                input_tokens=content_tokens + len(chunks) * (schema_tokens + prompt_tokens),
+                requests=len(chunks),
+            )
+        )
+    return estimate
+
+
 def extract_layer(
     client,
     ingestion: IngestionResult,
@@ -253,15 +402,21 @@ def extract_layer(
         result.warnings.append(f"Layer {layer.qualified_id} has no body pages to extract from.")
         return result
 
-    chunks = _chunk_pages(pages)
-    result.chunk_count = len(chunks)
-    if len(chunks) > 1:
-        result.warnings.append(
-            f"Layer {layer.qualified_id} spans {len(pages)} pages and was split "
-            f"into {len(chunks)} requests (API limit is {MAX_PAGES_PER_REQUEST} pages)."
-        )
-
     schema = build_output_schema(specs)
+    schema_tokens = estimate_tokens(len(json.dumps(schema)))
+    chunks, chunk_warnings = _chunk_pages(ingestion, pages, schema_tokens)
+    result.chunk_count = len(chunks)
+    result.warnings.extend(chunk_warnings)
+    if len(chunks) > 1:
+        layer_tokens = estimate_tokens(
+            sum(ingestion.inventory.page(p).char_count for p in pages)
+        )
+        result.warnings.append(
+            f"Layer {layer.qualified_id} is an estimated {layer_tokens:,} tokens "
+            f"across {len(pages)} pages and was split into {len(chunks)} requests. "
+            "Values appearing in more than one chunk are reconciled; conflicting "
+            "readings are reported rather than resolved."
+        )
     per_chunk: list[list[ExtractedField]] = []
 
     for index, page_map in enumerate(chunks):
@@ -335,12 +490,18 @@ def extract_document(
     ingestion: IngestionResult,
     pdf_bytes: bytes,
     layer_ids: tuple[str, ...] = EXTRACTABLE_LAYERS,
+    max_cost_usd: float | None = None,
 ) -> ExtractionRun:
     """
     Extract structured fields from every extractable layer of one document.
 
     Refuses to run when ingestion blocked the document: extracting around
     pages we could not read yields a result that looks complete and is not.
+
+    `max_cost_usd` is a spend ceiling checked before the first request. A
+    filing several times larger than expected, or one whose layers were
+    mis-segmented so the whole document landed in a single layer, would
+    otherwise be discovered only on the invoice.
     """
     run = ExtractionRun(
         document_id=ingestion.document_id,
@@ -363,6 +524,15 @@ def extract_document(
     targets = [l for l in ingestion.layers if l.layer_id in layer_ids]
     if not targets:
         run.error = "No extractable layer was identified in this document."
+        return run
+
+    run.estimate = estimate_run(ingestion, specs, layer_ids)
+    if max_cost_usd is not None and run.estimate.cost_high > max_cost_usd:
+        run.error = (
+            f"Extraction halted before any request: estimated cost "
+            f"${run.estimate.cost_low:.2f}-${run.estimate.cost_high:.2f} exceeds "
+            f"the ${max_cost_usd:.2f} ceiling. {run.estimate.describe()}"
+        )
         return run
 
     for layer in targets:

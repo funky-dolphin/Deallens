@@ -21,6 +21,7 @@ from deallens.extraction.models import ExtractedField
 from deallens.extraction.registry import BY_NAME, fields_for
 from deallens.ingestion import ingest
 
+from .conftest import requires_bio_techne
 from .pdf_factory import agreement_pages, exhibit_cover, make_pdf, sec_cover_page
 
 
@@ -450,3 +451,90 @@ def test_page_markers_number_within_the_excerpt_not_the_source():
     assert "[PAGE 1]\nfirst" in rendered
     assert "[PAGE 3]\nthird" in rendered
     assert "[PAGE 50]" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Request sizing: tokens, not pages
+# ---------------------------------------------------------------------------
+
+def test_many_small_pages_are_not_split_into_requests():
+    """
+    Page count says nothing about request size. A document of 500 short pages
+    is small; splitting it would re-send the schema for no reason.
+    """
+    from deallens.extraction.extractor import estimate_run
+
+    pages = [exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")] + [
+        f"ARTICLE {n} COVENANTS\nShort clause {n}.\n{n}" for n in range(1, 500)
+    ]
+    ing = ingest(make_pdf(pages), "many-small.pdf", run_id="r")
+    estimate = estimate_run(ing)
+    agreement = next(l for l in estimate.layers if l.layer_id.startswith("agreement"))
+
+    assert agreement.pages >= 400
+    assert agreement.requests == 1, "500 short pages fit comfortably in one request"
+
+
+def test_chunking_is_driven_by_token_budget():
+    """A layer beyond the context budget is split; the split is by size."""
+    from deallens.extraction.extractor import _chunk_pages
+
+    pages = [exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")] + agreement_pages(body_pages=20)
+    ing = ingest(make_pdf(pages), "x.pdf", run_id="r")
+    agreement = ing.agreement_layer
+    body = agreement.body_pages()
+
+    one_chunk, _ = _chunk_pages(ing, body, schema_tokens=6_000)
+    assert len(one_chunk) == 1
+
+    # Force a tiny budget by claiming an enormous schema.
+    many, _ = _chunk_pages(ing, body, schema_tokens=999_000)
+    assert len(many) > 1
+    assert [p for chunk in many for p in chunk] == body, "no page may be dropped or duplicated"
+
+
+def test_oversized_single_page_is_reported_not_silently_truncated():
+    from deallens.extraction.extractor import _chunk_pages
+
+    pages = [exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")] + agreement_pages(body_pages=3)
+    ing = ingest(make_pdf(pages), "x.pdf", run_id="r")
+    chunks, warnings = _chunk_pages(ing, ing.agreement_layer.body_pages(), schema_tokens=999_950)
+    assert any("above the" in w and "request budget" in w for w in warnings)
+
+
+@requires_bio_techne
+def test_offline_estimate_tracks_the_measured_token_count():
+    """
+    The pre-flight estimate gates real spend, so it must not understate.
+    Measured against the API's own count for the development filing
+    (133,128 tokens): the estimate should be close, and high rather than low.
+    """
+    from deallens.extraction.extractor import estimate_run
+    from deallens.ingestion import ingest as _ingest
+
+    ing = _ingest(open("8k bio-techne.pdf", "rb").read(), "b.pdf", run_id="r")
+    estimated = estimate_run(ing).input_tokens
+    measured = 133_128
+    assert estimated >= measured, "an estimate that understates cannot guard spend"
+    assert estimated / measured < 1.20, f"estimate {estimated:,} is more than 20% above measured"
+
+
+# ---------------------------------------------------------------------------
+# Spend ceiling
+# ---------------------------------------------------------------------------
+
+def test_cost_ceiling_halts_before_any_request(ingested, composite_pdf):
+    client = FakeClient()
+    run = extract_document(client, ingested, composite_pdf, max_cost_usd=0.001)
+
+    assert client.calls == 0, "no request may be made once the ceiling is exceeded"
+    assert run.error and "exceeds the $0.00 ceiling" in run.error
+    assert run.fields == []
+
+
+def test_cost_ceiling_allows_a_run_within_budget(ingested, composite_pdf):
+    client = FakeClient()
+    run = extract_document(client, ingested, composite_pdf, max_cost_usd=100.0)
+    assert client.calls == 2
+    assert run.error is None
+    assert run.estimate is not None and run.estimate.requests == 2

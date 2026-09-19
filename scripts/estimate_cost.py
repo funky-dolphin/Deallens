@@ -81,7 +81,10 @@ def main(path: str) -> int:
     # approximated at the usual 4 characters per token.
     schema_tokens = len(json.dumps(schema)) // 4
     total_input += schema_tokens * len(layers)
-    print(f"  {'output schema x' + str(len(layers)):<22} {'':>3}         {schema_tokens * len(layers):>9,} input tokens (approx)")
+    # The schema is re-sent with every request, not once per run -- which is
+    # why a layer that has to be chunked costs more than its content alone.
+    label = f"schema x{len(layers)} requests"
+    print(f"  {label:<22} {'':>3}         {schema_tokens * len(layers):>9,} input tokens (approx)")
     print(f"  {'TOTAL INPUT':<22} {'':>3}         {total_input:>9,}\n")
 
     input_cost = total_input * INPUT_PER_MTOK / 1_000_000
