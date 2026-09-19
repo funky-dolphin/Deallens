@@ -147,6 +147,68 @@ def test_value_in_only_one_layer_is_reported_as_one_sided():
     assert agreement_only.classification == AGREEMENT_ONLY
 
 
+def test_a_silent_layer_and_a_withheld_layer_read_differently():
+    """
+    Both come out `agreement only`, but they are not the same finding. Most
+    contract mechanics never appear in an 8-K summary and need nothing from
+    anyone; a reading a control withheld has a value in the review queue and a
+    page to check it against. One reason string for both hid the second.
+    """
+    silent = compare_field(
+        "matching_rights",
+        LayerReading(layer="filing-summary", status=models.NOT_FOUND),
+        _reading("four business days", page="A-52"),
+    )
+    withheld = compare_field(
+        "outside_date",
+        LayerReading(
+            layer="filing-summary",
+            status=models.UNRESOLVED,
+            raw_value="the second half of 2026",
+            page="3",
+        ),
+        _reading("2027-06-25", page="A-9"),
+    )
+
+    assert silent.classification == withheld.classification == AGREEMENT_ONLY
+    assert "does not mention it" in silent.reason
+    assert "withheld" in withheld.reason
+    assert "the second half of 2026" in withheld.reason
+    assert "review queue" in withheld.reason
+
+
+def test_the_one_sided_reason_is_symmetric_between_layers():
+    """The summary-only path said this; the agreement-only path did not."""
+    summary_side = compare_field(
+        "total_transaction_value",
+        _reading(5_700_000_000.0, layer="filing-summary"),
+        LayerReading(layer="agreement", status=models.UNRESOLVED, raw_value="approximately $5.7 billion"),
+    )
+    assert summary_side.classification == SUMMARY_ONLY
+    assert "withheld" in summary_side.reason
+    assert "review queue" in summary_side.reason
+
+
+def test_a_withheld_reading_keeps_its_page_for_the_reviewer():
+    """
+    The page is what makes the withheld reading checkable, so withholding the
+    value must not discard it.
+    """
+    result = compare_field(
+        "outside_date",
+        LayerReading(
+            layer="filing-summary",
+            status=models.UNRESOLVED,
+            raw_value="the second half of 2026",
+            page="3",
+        ),
+        _reading("2027-06-25", page="A-9"),
+    )
+    assert result.summary.normalized_value is None
+    assert result.summary.page == "3"
+    assert result.summary.raw_value == "the second half of 2026"
+
+
 def test_a_field_neither_layer_reports_is_unresolved_and_says_so():
     result = compare_field(
         "bridge_amount",

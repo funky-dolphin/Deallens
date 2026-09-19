@@ -235,6 +235,32 @@ def _values_equivalent(left: object, right: object) -> bool:
     return _values_identical(left, right)
 
 
+def _one_sided_reason(present: str, absent: str, absent_reading: LayerReading) -> str:
+    """
+    Why only one of the two layers produced a value.
+
+    A layer that is silent on a term and a layer whose reading a control
+    withheld are different findings. The first needs nothing: most of these
+    fields are contract mechanics an 8-K summary never mentions. The second
+    has a value sitting in the review queue and a page to check it against.
+    Reporting both as "only the other layer supports a value" hides the one
+    that has work attached to it.
+    """
+    if not absent_reading.was_attempted:
+        return f"Only the {present} supports a value; the {absent} does not mention it."
+    if absent_reading.raw_value:
+        return (
+            f"Only the {present} supports a value. The {absent} reported "
+            f"{absent_reading.raw_value!r}, which a control withheld — it is in "
+            "the review queue."
+        )
+    return (
+        f"Only the {present} supports a value. The {absent} yielded a reading "
+        f"that a control withheld ({absent_reading.status}) — it is in the "
+        "review queue."
+    )
+
+
 def compare_field(
     field_name: str, summary: LayerReading, agreement: LayerReading
 ) -> FieldComparison:
@@ -310,11 +336,7 @@ def compare_field(
 
     if summary_ok:
         comparison.classification = SUMMARY_ONLY
-        comparison.reason = (
-            "Only the filing summary supports a value; the agreement did not yield one."
-            if agreement.was_attempted
-            else "Only the filing summary supports a value."
-        )
+        comparison.reason = _one_sided_reason("filing summary", "agreement", agreement)
         comparison.preferred_layer = summary.layer or LAYER_FILING_SUMMARY
         comparison.preferred_value = summary.normalized_value
         comparison.preferred_reading = summary
@@ -322,7 +344,7 @@ def compare_field(
 
     if agreement_ok:
         comparison.classification = AGREEMENT_ONLY
-        comparison.reason = "Only the agreement supports a value."
+        comparison.reason = _one_sided_reason("agreement", "filing summary", summary)
         comparison.preferred_layer = agreement.layer or LAYER_AGREEMENT
         comparison.preferred_value = agreement.normalized_value
         comparison.preferred_reading = agreement

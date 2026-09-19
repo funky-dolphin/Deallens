@@ -99,6 +99,22 @@ def _anthropic_client(api_key: str):
     return anthropic.Anthropic(api_key=api_key)
 
 
+def _layer_cell(reading) -> object | None:
+    """
+    What one layer's value column shows.
+
+    A blank cell would otherwise mean two different things: the layer never
+    mentioned the field, or it did and a control withheld what it said. The
+    second keeps its page, so a bare blank next to a page number reads as a
+    missing value rather than a deliberate one.
+    """
+    if reading.normalized_value is not None:
+        return reading.normalized_value
+    if reading.raw_value:
+        return "withheld — see review queue"
+    return None
+
+
 def _doc_picker(label: str = "Document") -> str | None:
     """Select one persisted document; returns its document_id."""
     docs = get_documents(conn)
@@ -364,9 +380,9 @@ elif page.startswith("3"):
                                     # that matches is in good shape.
                                     "critical": c.is_critical,
                                     "classification": c.classification.replace("_", " "),
-                                    "filing summary": c.summary.normalized_value,
+                                    "filing summary": _layer_cell(c.summary),
                                     "summary p.": c.summary.page,
-                                    "agreement": c.agreement.normalized_value,
+                                    "agreement": _layer_cell(c.agreement),
                                     "agreement p.": c.agreement.page,
                                     # Two sources are compared, so two value
                                     # columns. The governing value is always a
