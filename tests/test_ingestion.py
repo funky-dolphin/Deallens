@@ -309,3 +309,21 @@ def test_bio_techne_structure_is_unambiguous(bio_techne_ingested):
     """A one-step merger should not register as a hybrid."""
     assert bio_techne_ingested.structure.secondary_structures == []
     assert bio_techne_ingested.structure.review_status == "unreviewed"
+
+
+def test_short_cover_pages_do_not_make_a_document_unreadable():
+    """
+    Regression: an earlier rule required 95% of pages to exceed 100
+    characters, so an ordinary filing with a short cover page was classed
+    unreadable and routed to the page-image path at twice the token cost.
+    """
+    from tests.pdf_factory import agreement_pages, make_pdf, sec_cover_page
+
+    # A signature page: real content, well under the sparse threshold.
+    signature_page = "IN WITNESS WHEREOF the parties have signed.\nBy: _____"
+    inventory = load_pdf(
+        make_pdf([sec_cover_page(), signature_page, *agreement_pages(body_pages=4)]), "x.pdf"
+    )
+    assert any(p.text_layer_status == "sparse" for p in inventory.pages)
+    assert inventory.is_machine_readable
+    assert not inventory.has_degraded_text

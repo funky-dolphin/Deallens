@@ -33,6 +33,7 @@ from .client import (
     MAX_PAGES_PER_REQUEST,
     MODEL_ID,
     ExtractionResponse,
+    build_text_content,
     extract_structured,
     slice_pdf,
 )
@@ -270,12 +271,24 @@ def extract_layer(
             structure=ingestion.structure.structure,
             page_range=(page_map[0], page_map[-1]),
         )
+        # Machine-readable documents go as text; the rest fall back to page
+        # images. Ingestion already made this determination, so extraction
+        # does not re-litigate it.
+        if ingestion.inventory.is_machine_readable:
+            source = {
+                "document_text": build_text_content(
+                    [(page, ingestion.inventory.text_for(page)) for page in page_map]
+                )
+            }
+        else:
+            source = {"pdf_bytes": slice_pdf(pdf_bytes, page_map)}
+
         response: ExtractionResponse = extract_structured(
             client,
-            pdf_bytes=slice_pdf(pdf_bytes, page_map),
             system_prompt=SYSTEM_PROMPT,
             user_prompt=prompt,
             output_schema=schema,
+            **source,
         )
         result.input_tokens += response.input_tokens
         result.output_tokens += response.output_tokens

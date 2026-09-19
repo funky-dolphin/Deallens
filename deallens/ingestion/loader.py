@@ -114,19 +114,34 @@ class DocumentInventory:
         return any(p.text_layer_status == "image_only" for p in self.pages)
 
     @property
+    def has_degraded_text(self) -> bool:
+        """
+        Pages carrying images alongside very little text.
+
+        The signature of a partial or failed text layer: something was
+        rendered on the page that the extractor did not capture. Distinct from
+        a genuinely short page, which is simply short.
+        """
+        return any(p.text_layer_status == "sparse" and p.has_images for p in self.pages)
+
+    @property
     def is_machine_readable(self) -> bool:
         """
-        Whole-document verdict.
+        Whether this document's extracted text can be trusted as complete.
 
-        Requires that no page needs OCR *and* that the bulk of pages carry real
-        text. A document that is 90% readable is not machine-readable for our
-        purposes, because the unreadable remainder may hold the very clause a
-        downstream answer depends on.
+        True when no page needs OCR, no page shows signs of a degraded text
+        layer, and the document carries text at all.
+
+        Note what is deliberately *not* required: that most pages be long. An
+        earlier version demanded 95% of pages exceed 100 characters, which
+        conflated a short cover or signature page -- where nothing is missing
+        -- with a page whose content we failed to read. Ordinary filings have
+        several short pages, so that rule pushed perfectly readable documents
+        onto the page-image path at roughly twice the token cost for no gain.
         """
-        if self.page_count == 0:
+        if self.page_count == 0 or self.total_chars == 0:
             return False
-        readable = sum(1 for p in self.pages if p.text_layer_status == "machine_readable")
-        return not self.requires_ocr and readable / self.page_count >= 0.95
+        return not self.requires_ocr and not self.has_degraded_text
 
 
 def compute_checksum(pdf_bytes: bytes) -> str:

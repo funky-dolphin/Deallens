@@ -385,3 +385,68 @@ def test_required_output_schema_matches_the_assignment():
     }
     assert payload["normalized_value"] == 73.0
     assert payload["page"] == "3", "printed page is the citable number when reconciled"
+
+
+# ---------------------------------------------------------------------------
+# Cost control: source selection
+# ---------------------------------------------------------------------------
+
+def test_machine_readable_documents_are_sent_as_text(ingested, composite_pdf):
+    """
+    A PDF block is billed for a rendered image of every page. Where ingestion
+    already extracted and verified the text, those images buy nothing -- on
+    the development filing they were ~2,700 tokens per page against ~1,200.
+    """
+    assert ingested.inventory.is_machine_readable
+    client = FakeClient()
+    extract_document(client, ingested, composite_pdf)
+
+    content = client.prompts[0]["messages"][0]["content"]
+    assert content[0]["type"] == "text", "machine-readable text must not be sent as page images"
+    assert "[PAGE 1]" in content[0]["text"], "page markers carry the excerpt numbering"
+    assert content[0]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_unreadable_documents_fall_back_to_page_images():
+    """
+    Where the text layer is incomplete, the rendered page is the only way to
+    read the document, so the PDF block remains the fallback path.
+    """
+    from deallens.extraction.client import extract_structured
+
+    pages = [exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")] + agreement_pages(body_pages=3)
+    ing = ingest(make_pdf(pages), "x.pdf", run_id="r")
+    # A page carrying an image and only a scrap of text: the signature of a
+    # partial text layer. Not blocked -- there is text -- but not trustworthy
+    # enough to read without the rendered page.
+    ing.inventory.pages[2].char_count = 40
+    ing.inventory.pages[2].has_images = True
+    assert ing.inventory.has_degraded_text
+    assert not ing.inventory.is_machine_readable
+    assert ing.may_extract
+
+    client = FakeClient()
+    extract_document(client, ing, make_pdf(pages))
+    content = client.prompts[0]["messages"][0]["content"]
+    assert content[0]["type"] == "document"
+    assert content[0]["source"]["media_type"] == "application/pdf"
+
+
+def test_extract_structured_requires_a_source():
+    from deallens.extraction.client import extract_structured
+
+    with pytest.raises(ValueError, match="document_text or pdf_bytes"):
+        extract_structured(FakeClient(), "sys", "user", {"required": []})
+
+
+def test_page_markers_number_within_the_excerpt_not_the_source():
+    """
+    The model is asked for a page within the excerpt, and page_map translates
+    it back. Marking pages with their source number would double-translate.
+    """
+    from deallens.extraction.client import build_text_content
+
+    rendered = build_text_content([(50, "first"), (51, "second"), (52, "third")])
+    assert "[PAGE 1]\nfirst" in rendered
+    assert "[PAGE 3]\nthird" in rendered
+    assert "[PAGE 50]" not in rendered

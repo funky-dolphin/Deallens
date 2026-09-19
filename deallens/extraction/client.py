@@ -29,6 +29,27 @@ MAX_PAGES_PER_REQUEST = 600
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
 
+def build_text_content(pages: list[tuple[int, str]]) -> str:
+    """
+    Render an excerpt as marked-up plain text.
+
+    Each page is prefixed with its position WITHIN THE EXCERPT, which is what
+    the prompt asks the model to report, so the page it returns maps back to
+    the source with no arithmetic on either side.
+
+    Sending text rather than a PDF document block is the single largest cost
+    lever in this pipeline. A PDF block is billed as extracted text *and* a
+    rendered image of every page; on the development filing that was ~2,700
+    tokens per page against ~1,200 for the same content as text. We already
+    hold the text -- ingestion extracted and verified it -- so paying to have
+    the pages rendered and read again buys nothing on a machine-readable
+    document.
+    """
+    return "\n\n".join(
+        f"[PAGE {position}]\n{text}" for position, (_source_page, text) in enumerate(pages, 1)
+    )
+
+
 @dataclass
 class ExtractionResponse:
     """Raw result of one extraction call."""
@@ -64,16 +85,23 @@ def slice_pdf(pdf_bytes: bytes, pages: list[int]) -> bytes:
 
 def extract_structured(
     client,
-    pdf_bytes: bytes,
     system_prompt: str,
     user_prompt: str,
     output_schema: dict,
+    document_text: str | None = None,
+    pdf_bytes: bytes | None = None,
     model_id: str = MODEL_ID,
 ) -> ExtractionResponse:
     """
     One structured-extraction call against a PDF excerpt.
 
     Design choices worth stating:
+
+      * Text is sent in preference to a PDF document block whenever ingestion
+        found the document machine-readable, because a PDF block is billed for
+        page images we do not need. `pdf_bytes` remains the path for documents
+        whose text layer is incomplete, where the rendered page is the only
+        way to read them. Exactly one of `document_text` / `pdf_bytes` is used.
 
       * Structured outputs rather than parsing JSON out of prose. The previous
         implementation stripped markdown fences and called `json.loads`, which
@@ -93,7 +121,25 @@ def extract_structured(
       * Adaptive thinking at high effort. Locating a burdensome-condition
         limitation across a 90-page agreement is not a lookup.
     """
-    encoded = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    if document_text is None and pdf_bytes is None:
+        raise ValueError("extract_structured requires either document_text or pdf_bytes")
+
+    if document_text is not None:
+        source_block = {
+            "type": "text",
+            "text": document_text,
+            "cache_control": {"type": "ephemeral"},
+        }
+    else:
+        source_block = {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": base64.standard_b64encode(pdf_bytes).decode("utf-8"),
+            },
+            "cache_control": {"type": "ephemeral"},
+        }
 
     with client.messages.stream(
         model=model_id,
@@ -108,18 +154,7 @@ def extract_structured(
         messages=[
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": encoded,
-                        },
-                        "cache_control": {"type": "ephemeral"},
-                    },
-                    {"type": "text", "text": user_prompt},
-                ],
+                "content": [source_block, {"type": "text", "text": user_prompt}],
             }
         ],
         thinking={"type": "adaptive"},
