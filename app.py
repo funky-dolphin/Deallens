@@ -14,6 +14,7 @@ into the page.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import uuid
@@ -22,7 +23,17 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
-from deallens.analytics.hedging import BIO_TECHNE_ASSUMPTIONS, run_scenarios
+from deallens.analytics.hedging import (
+    ADDITIONAL_ASSUMPTIONS,
+    ASSUMPTIONS_VERSION,
+    BIO_TECHNE_ASSUMPTIONS,
+    RISK_FACTORS,
+    RISK_LABELS,
+    deal_from_rows,
+    probability_weighted,
+    risk_exposures,
+    run_scenarios,
+)
 from deallens.comparison import (
     CLASS_ORDER,
     CONFLICT,
@@ -135,6 +146,24 @@ def _layer_cell(reading) -> object | None:
     return None
 
 
+def _stat(column, label: str, value: str) -> None:
+    """
+    One summary figure, smaller than `st.metric` renders them.
+
+    `st.metric` sets its value at roughly 2.25rem, which for five figures
+    across a row reads as a dashboard headline rather than a document
+    summary. Values are escaped because this is the one place the app emits
+    raw HTML.
+    """
+    column.markdown(
+        f"<div style='font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;"
+        f"color:#808495'>{html.escape(label)}</div>"
+        f"<div style='font-size:1.05rem;font-weight:600;line-height:1.5'>"
+        f"{html.escape(value)}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _doc_picker(label: str = "Document") -> str | None:
     """Select one persisted document; returns its document_id."""
     docs = get_documents(conn)
@@ -211,11 +240,19 @@ if page.startswith("1"):
             status, "⛔"
         )
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Pages", doc["page_count"])
-        c2.metric("Status", f"{badge} {status}")
-        c3.metric("Structure", doc["transaction_structure"])
-        c4.metric("Structure confidence", f"{doc['structure_confidence']:.0%}")
+        # Machine-readability decides whether extraction sends text or page
+        # images, which is the largest cost lever in the pipeline, so it
+        # belongs in the summary rather than buried in the footnote below.
+        machine_readable = bool(doc["is_machine_readable"])
+        stats = [
+            ("Pages", str(doc["page_count"])),
+            ("Machine readable", "Yes" if machine_readable else "No — needs OCR"),
+            ("Status", f"{badge} {status}"),
+            ("Structure", doc["transaction_structure"]),
+            ("Structure confidence", f"{doc['structure_confidence']:.0%}"),
+        ]
+        for column, (label, value) in zip(st.columns(len(stats)), stats):
+            _stat(column, label, value)
 
         if status == "blocked":
             st.error(
@@ -225,7 +262,6 @@ if page.startswith("1"):
 
         st.caption(
             f"checksum `{doc['checksum'][:16]}…` · {doc['byte_size']:,} bytes · "
-            f"machine-readable: {bool(doc['is_machine_readable'])} · "
             f"ingested {doc['ingestion_timestamp']} · ingestion v{doc['ingestion_version']}"
         )
 
@@ -461,8 +497,6 @@ elif page.startswith("3"):
                                 )
                                 if reading.evidence:
                                     st.caption(f"“{reading.evidence}”")
-                                if reading.locator_uri:
-                                    st.code(reading.locator_uri, language=None)
                             else:
                                 st.caption("Nothing was read from this layer.")
 
@@ -618,8 +652,6 @@ elif page.startswith("4"):
                         f"{entry.layer or 'no layer'} · page {entry.page} · "
                         f"{entry.section_ref or 'no section'}"
                     )
-                    if entry.locator_uri:
-                        st.code(entry.locator_uri, language=None)
 
             st.download_button(
                 "Download timeline (JSON)",
@@ -660,8 +692,6 @@ elif page.startswith("5"):
                     )
                 for note in row["notes"]:
                     st.caption(f"· {note}")
-                if row["locator_uri"]:
-                    st.code(row["locator_uri"], language=None)
 
                 note = st.text_input("Reviewer note", key=f"note-{row['id']}")
                 c1, c2 = st.columns(2)
@@ -702,6 +732,11 @@ elif page.startswith("6"):
         )
 
     with st.expander("Assumptions", expanded=False):
+        st.caption(
+            f"Assumptions version `{ASSUMPTIONS_VERSION}`. The block below is the "
+            "assignment's standardized input, verbatim and synthetic — none of it "
+            "is extracted from the agreement."
+        )
         c1, c2, c3 = st.columns(3)
         c1.markdown("**Financing**")
         c1.json(BIO_TECHNE_ASSUMPTIONS["financing"])
@@ -710,31 +745,108 @@ elif page.startswith("6"):
         c3.markdown("**Transaction**")
         c3.json(BIO_TECHNE_ASSUMPTIONS["transaction"])
 
-    if st.button("Run scenarios", type="primary"):
-        df = pd.DataFrame(run_scenarios(horizon=horizon))
-
-        st.subheader("Scenario results")
+        st.markdown("**Additional synthetic assumptions**")
+        st.caption(
+            "Inputs the assignment does not supply but the required scenarios "
+            "cannot be priced without. Each is stated with the reason it is needed."
+        )
         st.dataframe(
-            df[
+            pd.DataFrame(
                 [
-                    "scenario",
-                    "strategy",
-                    "rate_shift_bps",
-                    "credit_spread_shift_bps",
-                    "dv01",
-                    "delay_days",
-                    "net_pnl",
+                    {"assumption": name, "value": value, "why it is required": reason}
+                    for name, (value, reason) in ADDITIONAL_ASSUMPTIONS.items()
                 ]
-            ].style.format({"dv01": "${:,.0f}", "net_pnl": "${:,.0f}"}),
+            ),
             width="stretch",
             hide_index=True,
         )
 
-        st.subheader("Net P&L by strategy")
-        pivot = df.pivot_table(
-            index="scenario", columns="strategy", values="net_pnl", aggfunc="first"
+    st.caption(
+        "**Sign convention:** positive is a gain to the issuer, negative a cost. "
+        "The coupon is not yet fixed, so a rise in rates is a loss. Every figure "
+        "is the change against the base case."
+    )
+
+    if st.button("Run scenarios", type="primary"):
+        deal = deal_from_rows(rows) if document_id and rows else None
+        results = run_scenarios(horizon=horizon, deal=deal)
+        frame = pd.DataFrame([r.to_dict() for r in results])
+
+        st.subheader("Scenario results")
+        st.caption(
+            "One table per scenario; one row per strategy. Columns are the seven "
+            "risks the analysis keeps separate — a zero means the strategy is not "
+            "exposed to that risk in that scenario, not that it was ignored."
         )
-        st.dataframe(pivot.style.format("${:,.0f}"), width="stretch")
+
+        money = {RISK_LABELS[f]: "${:,.0f}" for f in RISK_FACTORS}
+        money["Net P&L"] = "${:,.0f}"
+
+        for scenario_id in frame["scenario_id"].unique():
+            rows_for = [r for r in results if r.scenario_id == scenario_id]
+            heading = rows_for[0].scenario
+            if rows_for[0].delay_days is not None:
+                heading += f" · {rows_for[0].delay_days} days → {rows_for[0].delayed_to}"
+            st.markdown(f"**{heading}**")
+
+            table = pd.DataFrame(
+                [
+                    {
+                        "Strategy": r.strategy,
+                        **{RISK_LABELS[f]: r.attribution.get(f, 0.0) for f in RISK_FACTORS},
+                        "Net P&L": r.net_pnl,
+                    }
+                    for r in rows_for
+                ]
+            )
+            st.dataframe(
+                table.style.format(money), width="stretch", hide_index=True
+            )
+            for note in dict.fromkeys(n for r in rows_for for n in r.notes):
+                st.caption(f"· {note}")
+            st.divider()
+
+        st.subheader("Risk exposure by strategy")
+        st.caption(
+            "What each strategy is exposed to per basis point, including risks "
+            "no required scenario happens to shock. A risk a strategy carries is "
+            "still a risk it carries."
+        )
+        st.dataframe(
+            pd.DataFrame(risk_exposures(deal=deal)).rename(
+                columns={f: RISK_LABELS[f] for f in RISK_FACTORS}
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
+        st.subheader("Probability-weighted outcome")
+        st.caption(
+            "Weighted over the delay and failure scenarios only. The rate shocks "
+            "are sensitivities, not outcomes with a likelihood."
+        )
+        weighted = probability_weighted(results)
+        for column, (strategy, value) in zip(st.columns(len(weighted)), weighted.items()):
+            _stat(column, strategy, f"${value:,.0f}")
+
+        st.download_button(
+            "Download scenarios (JSON)",
+            data=json.dumps(
+                {
+                    "assumptions_version": ASSUMPTIONS_VERSION,
+                    "assumptions": BIO_TECHNE_ASSUMPTIONS,
+                    "additional_assumptions": {
+                        name: {"value": value, "why_required": reason}
+                        for name, (value, reason) in ADDITIONAL_ASSUMPTIONS.items()
+                    },
+                    "results": [r.to_dict() for r in results],
+                },
+                indent=2,
+                default=str,
+            ),
+            file_name="hedging_scenarios.json",
+            mime="application/json",
+        )
 
 
 # ── 7 · Q&A ───────────────────────────────────────────────────────────────────

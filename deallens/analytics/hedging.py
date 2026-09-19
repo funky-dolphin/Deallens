@@ -1,266 +1,552 @@
 """
-hedging.py
-Workstream 5 - Hedging and Financing Analytics
-All inputs are synthetic assumptions unless extracted from the document.
+Hedging and financing analytics (Workstream 5).
 
-Timing comes from Workstream 4. The delay scenarios take their dates from the
-timeline's hedge horizon rather than deriving a close date here: the timeline
-already computes it from the agreement's extension clause and shows the
-arithmetic, and two modules deriving the same date from the same agreement is
-two chances to disagree about it.
+The issuer plans to raise USD 4bn of seven-year fixed-rate debt to fund a cash
+merger. Between signing and issuance it is exposed to rates, to spreads, and
+to the deal itself not closing. This module prices the seven required
+scenarios against the three required strategies, and attributes every result
+to one of the seven risks the assignment requires be kept apart.
+
+Sign convention
+---------------
+Positive is a gain to the issuer, negative a cost. The issuer has not yet
+issued, so a rise in rates raises the coupon it will pay and is a loss; a fall
+is a gain. A forward-starting payer swap gains when rates rise, which is what
+makes it a hedge. Every figure below is the change against the base case, not
+an absolute funding cost.
+
+What is a fact, what is an assumption, what is a calculation
+------------------------------------------------------------
+Nothing here is extracted from the agreement except the deal's currencies and
+the closing dates, and both are marked as such where they are used. The market
+and financing inputs are the assignment's standardized synthetic assumptions.
+Where the assignment leaves something unspecified -- the size of the "parallel
+rate move", what a deal-contingent hedge costs -- the gap is filled in
+`ADDITIONAL_ASSUMPTIONS`, each with the reason it is needed. Everything else
+is arithmetic on those two sets.
+
+What the hedges do and do not cover
+-----------------------------------
+This is the point of separating the risks. A forward-starting swap references
+the swap rate; the bond will price off the benchmark plus the issuer's own
+credit spread. So the swap neutralises benchmark-rate risk, leaves swap-spread
+basis behind, and does nothing at all about issuer credit spread -- which is
+why scenario 4 hurts every strategy. A deal-contingent hedge adds termination
+without breakage if the deal fails, and charges a premium for it in every
+scenario, including the ones where the deal closes and the premium buys
+nothing.
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass, field
 from datetime import date
 
+# Bumped whenever a number below changes, and recorded on every result, so a
+# figure can be traced to the inputs that produced it (Workstream 8).
+ASSUMPTIONS_VERSION = "2.0.0"
 
-# Default synthetic assumptions for Bio-Techne (from assignment)
+# The assignment's standardized Bio-Techne inputs, verbatim. Synthetic: these
+# must never be represented as facts extracted from the agreement.
 BIO_TECHNE_ASSUMPTIONS = {
     "financing": {
         "expected_debt_issuance_usd": 4_000_000_000,
         "expected_tenor_years": 7,
         "expected_issue_date": "2027-03-15",
-        "debt_fixed_rate": True
+        "debt_fixed_rate": True,
     },
     "market": {
         "treasury_rate": 0.0425,
         "swap_rate": 0.0440,
         "issuer_credit_spread": 0.0100,
-        "benchmark_dv01_per_100mm": 65_000
+        "benchmark_dv01_per_100mm": 65_000,
     },
     "transaction": {
         "base_case_close_probability": 0.85,
         "delayed_close_probability": 0.10,
-        "failure_probability": 0.05
-    }
+        "failure_probability": 0.05,
+    },
 }
 
+# Inputs the assignment does not supply but the required scenarios cannot be
+# priced without. Each carries the reason it is required, and each is as
+# synthetic as the block above.
+ADDITIONAL_ASSUMPTIONS = {
+    "parallel_rate_move_bps": (
+        25.0,
+        "Scenario 4 specifies a parallel rate move plus 20bp of credit widening "
+        "but not the size of the rate move. 25bp is used, matching scenario 1, "
+        "so the credit-spread effect is the only difference between them.",
+    ),
+    "deal_contingent_premium_bps": (
+        15.0,
+        "A deal-contingent hedge is paid for through a concession on the hedge "
+        "rate. No premium is supplied, so 15bp of rate is assumed -- within the "
+        "range such structures typically cost, and charged in every scenario "
+        "because it is paid whether or not the contingency is used.",
+    ),
+    "unwind_bid_offer_bps": (
+        2.0,
+        "Unwinding a conventional swap early crosses the bid-offer. No breakage "
+        "cost is supplied, so 2bp is assumed. This is the cost a deal-contingent "
+        "structure exists to avoid.",
+    ),
+    "credit_spread_dv01_ratio": (
+        1.0,
+        "Only a benchmark DV01 is supplied. Spread duration on a seven-year bond "
+        "is close to its rate duration, so the issuer's credit-spread DV01 is "
+        "taken as equal to it. Re-measure before using these figures to trade.",
+    ),
+    "swap_spread_dv01_ratio": (
+        1.0,
+        "As above, for the basis between the swap rate the hedge references and "
+        "the benchmark the bond prices off.",
+    ),
+}
 
-def compute_dv01(notional_usd, benchmark_dv01_per_100mm):
+# The seven risks the assignment requires be reported separately.
+BENCHMARK_RATE = "benchmark_rate"
+SWAP_SPREAD = "swap_spread"
+CREDIT_SPREAD = "issuer_credit_spread"
+FX = "fx"
+TIMING = "timing"
+COMPLETION = "transaction_completion"
+UNWIND = "hedge_unwind"
+
+RISK_FACTORS = (
+    BENCHMARK_RATE,
+    SWAP_SPREAD,
+    CREDIT_SPREAD,
+    FX,
+    TIMING,
+    COMPLETION,
+    UNWIND,
+)
+
+RISK_LABELS = {
+    BENCHMARK_RATE: "Benchmark rate",
+    SWAP_SPREAD: "Swap spread",
+    CREDIT_SPREAD: "Issuer credit spread",
+    FX: "FX",
+    TIMING: "Timing",
+    COMPLETION: "Completion",
+    UNWIND: "Unwind / breakage",
+}
+
+# The three required strategies.
+UNHEDGED = "Unhedged"
+FORWARD_STARTING = "Forward-starting IRS"
+DEAL_CONTINGENT = "Deal-contingent hedge"
+STRATEGIES = (UNHEDGED, FORWARD_STARTING, DEAL_CONTINGENT)
+
+
+@dataclass(frozen=True)
+class Scenario:
+    """One required scenario, with a stable identifier."""
+
+    scenario_id: str
+    label: str
+    rate_shift_bps: float = 0.0
+    credit_spread_shift_bps: float = 0.0
+    swap_spread_shift_bps: float = 0.0
+    delay_days: int | None = None
+    delayed_to: str | None = None
+    transaction_fails: bool = False
+    probability: float | None = None
+    note: str = ""
+
+
+@dataclass
+class ScenarioResult:
+    """One scenario under one strategy, attributed across the seven risks."""
+
+    scenario_id: str
+    scenario: str
+    strategy: str
+    attribution: dict[str, float] = field(default_factory=dict)
+    probability: float | None = None
+    delay_days: int | None = None
+    delayed_to: str | None = None
+    notes: list[str] = field(default_factory=list)
+    assumptions_version: str = ASSUMPTIONS_VERSION
+
+    @property
+    def net_pnl(self) -> float:
+        return sum(self.attribution.values())
+
+    def to_dict(self) -> dict:
+        payload = {
+            "scenario_id": self.scenario_id,
+            "scenario": self.scenario,
+            "strategy": self.strategy,
+            "probability": self.probability,
+            "delay_days": self.delay_days,
+            "delayed_to": self.delayed_to,
+            "net_pnl": self.net_pnl,
+            "assumptions_version": self.assumptions_version,
+            "notes": list(self.notes),
+        }
+        payload.update({factor: self.attribution.get(factor, 0.0) for factor in RISK_FACTORS})
+        return payload
+
+
+@dataclass(frozen=True)
+class DealCharacteristics:
     """
-    Dollar Value of a Basis Point for a given notional.
-    DV01 = (notional / 100mm) * benchmark_dv01
+    The extracted facts the analytics adapt to.
+
+    These are the only inputs here that come from the agreement. FX exposure
+    in particular is a property of the deal, not an assumption: a US cash
+    merger settled in dollars has none, and a German takeover offer in euros
+    has a great deal. Reading it from the extraction rather than hard-coding
+    zero is what lets the same analytics run against all three transactions.
+    """
+
+    base_currency: str = "USD"
+    consideration_currency: str | None = None
+    bridge_currency: str | None = None
+    bridge_amount: float | None = None
+
+    @property
+    def foreign_currencies(self) -> list[str]:
+        found = [
+            currency
+            for currency in (self.consideration_currency, self.bridge_currency)
+            if currency and currency.upper() != self.base_currency
+        ]
+        return sorted(set(found))
+
+    @property
+    def has_fx_exposure(self) -> bool:
+        return bool(self.foreign_currencies)
+
+
+def deal_from_rows(rows: list[dict]) -> DealCharacteristics:
+    """Read the currency facts out of an extraction, via the source hierarchy."""
+    from ..comparison import compare_layers
+
+    values = {
+        c.field_name: c.preferred_value
+        for c in compare_layers(rows)
+        if c.preferred_value is not None
+    }
+    return DealCharacteristics(
+        consideration_currency=values.get("consideration_currency"),
+        bridge_currency=values.get("bridge_currency"),
+        bridge_amount=values.get("bridge_amount"),
+    )
+
+
+def compute_dv01(notional_usd: float, benchmark_dv01_per_100mm: float) -> float:
+    """
+    Dollar value of a basis point for a given notional.
+
+    DV01 = (notional / 100mm) x benchmark_dv01
     """
     return (notional_usd / 100_000_000) * benchmark_dv01_per_100mm
 
 
-def compute_rate_pnl(dv01, rate_shift_bps):
+def compute_rate_pnl(dv01: float, rate_shift_bps: float) -> float:
     """
-    P&L impact of a rate move.
-    Positive shift = rates up = bond price down = negative P&L for issuer hedging.
-    rate_shift_bps: basis points (e.g. 25 for +25bps)
+    P&L to the pre-issuance issuer of a move in rates.
+
+    Negative for a rise: the issuer has not yet fixed its coupon, so higher
+    rates mean a more expensive bond.
     """
     return -dv01 * rate_shift_bps
 
 
-def compute_carry_cost(notional_usd, swap_rate, treasury_rate, delay_days):
+def compute_carry_cost(
+    notional_usd: float, swap_rate: float, treasury_rate: float, delay_days: int
+) -> float:
     """
     Cost of carrying a forward-starting hedge across a closing delay.
 
-    A hedge struck for an expected issuance date has to be rolled when closing
-    slips. The carry is approximated as the swap spread -- the swap rate over
-    the benchmark -- applied to the notional for the length of the delay:
+    A hedge struck for an expected issuance date must be rolled when closing
+    slips. Carry is approximated as the swap spread applied to the notional
+    for the length of the delay:
 
         notional x (swap_rate - treasury_rate) x delay_days / 365
-
-    This is the first use the swap spread has been put to; it was previously
-    read from the assumptions and never referenced. The figure is an
-    approximation and is labelled as a calculation, not an extracted fact.
     """
     return notional_usd * (swap_rate - treasury_rate) * (delay_days / 365.0)
 
 
-def _delay_scenarios(horizon):
+def build_scenarios(assumptions: dict, horizon=None) -> list[Scenario]:
     """
-    The two delay scenarios the assignment requires, dated from the timeline.
+    The seven required scenarios.
 
-    Returns (label, delay_days, dated_to) triples. The dates come from
-    Workstream 4's horizon rather than being derived again here: two modules
-    computing a close date from the same agreement is two chances to disagree
-    about it, and the timeline is the one that shows its arithmetic.
-
-    With no horizon, or one without calculated extension dates, no delay is
-    assumed. An invented delay would put a fabricated timing cost in front of
-    someone sizing a hedge.
+    The two delay scenarios take their dates from the Workstream 4 timeline
+    rather than deriving a close date here. Without a timeline they are still
+    reported, with no delay assumed -- an invented delay would put a
+    fabricated timing cost in front of someone sizing a hedge.
     """
+    transaction = assumptions["transaction"]
+    parallel = ADDITIONAL_ASSUMPTIONS["parallel_rate_move_bps"][0]
+
+    scenarios = [
+        Scenario("rates_up_25", "Rates +25bp", rate_shift_bps=25.0),
+        Scenario("rates_down_25", "Rates -25bp", rate_shift_bps=-25.0),
+        Scenario("rates_up_50", "Rates +50bp", rate_shift_bps=50.0),
+        Scenario(
+            "rates_and_credit",
+            f"Rates +{parallel:.0f}bp and credit +20bp",
+            rate_shift_bps=parallel,
+            credit_spread_shift_bps=20.0,
+            note="Parallel rate move sized by assumption; see additional assumptions.",
+        ),
+    ]
+
+    delays = _delay_scenarios(horizon)
+    # The assignment supplies one delayed-close probability for what is asked
+    # for as two scenarios. They are alternative ways the same delay outcome
+    # plays out, not two independent outcomes, so the probability is split
+    # between them -- giving each the full 0.10 would put the outcome
+    # probabilities at 1.10.
+    delay_probability = transaction["delayed_close_probability"] / len(delays)
+    for scenario_id, label, delay_days, dated_to in delays:
+        scenarios.append(
+            Scenario(
+                scenario_id,
+                label,
+                delay_days=delay_days,
+                delayed_to=dated_to,
+                probability=delay_probability,
+                note=(
+                    f"Delay of {delay_days} days to {dated_to}, from the agreement's "
+                    "extension clause via the Workstream 4 timeline (a calculated date)."
+                    if delay_days is not None
+                    else "No extension dates on the timeline; no delay assumed."
+                ),
+            )
+        )
+
+    scenarios.append(
+        Scenario(
+            "transaction_failure",
+            "Transaction failure",
+            transaction_fails=True,
+            probability=transaction["failure_probability"],
+            note="No issuance occurs. Rates are assumed unchanged at unwind.",
+        )
+    )
+    return scenarios
+
+
+def _delay_scenarios(horizon) -> list[tuple[str, str, int | None, str | None]]:
+    """The delay scenarios, dated from the timeline's hedge horizon."""
     if horizon is None or not horizon.outside_date or not horizon.extension_dates:
-        return []
+        return [
+            ("delay_first_extension", "Closing delayed to first extension date", None, None),
+            ("delay_final_extension", "Closing delayed to final extension date", None, None),
+        ]
 
     outside = date.fromisoformat(horizon.outside_date)
     dates = horizon.extension_dates
-    chosen = [("first", dates[0])]
+    chosen = [("delay_first_extension", "first", dates[0])]
     if len(dates) > 1:
-        chosen.append(("final", dates[-1]))
+        chosen.append(("delay_final_extension", "final", dates[-1]))
 
     return [
         (
+            scenario_id,
             f"Closing delayed to {which} extension date",
             (date.fromisoformat(when) - outside).days,
             when,
         )
-        for which, when in chosen
+        for scenario_id, which, when in chosen
     ]
 
 
-def run_scenarios(assumptions=None, horizon=None):
+def _attribute(
+    scenario: Scenario,
+    strategy: str,
+    assumptions: dict,
+    deal: DealCharacteristics,
+) -> tuple[dict[str, float], list[str]]:
     """
-    Run all required hedging scenarios.
+    Split one scenario's P&L across the seven risks for one strategy.
 
-    `horizon` is Workstream 4's HedgeHorizon. When supplied, the delay
-    scenarios use its extension dates and say how many days each represents;
-    without it they are reported as unavailable rather than assumed.
-
-    Returns a list of scenario result dicts.
+    Every factor is present in the result even when it is zero, because "this
+    strategy is not exposed to that risk" and "we did not consider that risk"
+    are different statements and the table has to tell them apart.
     """
-    if assumptions is None:
-        assumptions = BIO_TECHNE_ASSUMPTIONS
-
+    market = assumptions["market"]
     notional = assumptions["financing"]["expected_debt_issuance_usd"]
-    dv01_per_100mm = assumptions["market"]["benchmark_dv01_per_100mm"]
-    treasury_rate = assumptions["market"]["treasury_rate"]
-    swap_rate = assumptions["market"]["swap_rate"]
-    credit_spread = assumptions["market"]["issuer_credit_spread"]
-    close_prob = assumptions["transaction"]["base_case_close_probability"]
-    delay_prob = assumptions["transaction"]["delayed_close_probability"]
-    fail_prob = assumptions["transaction"]["failure_probability"]
+    dv01 = compute_dv01(notional, market["benchmark_dv01_per_100mm"])
+    credit_dv01 = dv01 * ADDITIONAL_ASSUMPTIONS["credit_spread_dv01_ratio"][0]
+    swap_spread_dv01 = dv01 * ADDITIONAL_ASSUMPTIONS["swap_spread_dv01_ratio"][0]
+    premium_bps = ADDITIONAL_ASSUMPTIONS["deal_contingent_premium_bps"][0]
+    bid_offer_bps = ADDITIONAL_ASSUMPTIONS["unwind_bid_offer_bps"][0]
 
-    dv01 = compute_dv01(notional, dv01_per_100mm)
+    attribution = {factor: 0.0 for factor in RISK_FACTORS}
+    notes: list[str] = []
+    hedged = strategy in (FORWARD_STARTING, DEAL_CONTINGENT)
 
-    scenarios = []
-
-    # Rate scenarios
-    rate_shifts = [
-        ("Rates +25bps", 25),
-        ("Rates -25bps", -25),
-        ("Rates +50bps", 50),
-    ]
-
-    for name, shift in rate_shifts:
-        for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
-            pnl = compute_rate_pnl(dv01, shift)
-            if strategy == "Forward-Starting IRS Hedge":
-                # Hedge offsets rate move, leaves swap spread and credit spread exposed
-                hedge_pnl = -pnl  # hedge gains offset losses
-                net_pnl = pnl + hedge_pnl
-            elif strategy == "Deal-Contingent Hedge":
-                # Only pays out if deal closes, weighted by probability
-                hedge_pnl = -pnl * close_prob
-                net_pnl = pnl + hedge_pnl
-            else:
-                net_pnl = pnl
-
-            scenarios.append({
-                "scenario": name,
-                "strategy": strategy,
-                "rate_shift_bps": shift,
-                "credit_spread_shift_bps": 0,
-                "dv01": dv01,
-                "gross_pnl": pnl,
-                "net_pnl": net_pnl,
-                "note": "Synthetic assumptions — not extracted from agreement"
-            })
-
-    # Parallel rate + credit spread widening
-    for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
-        rate_shift = 25
-        spread_shift = 20
-        rate_pnl = compute_rate_pnl(dv01, rate_shift)
-        spread_pnl = compute_rate_pnl(dv01, spread_shift)
-        gross = rate_pnl + spread_pnl
-
-        if strategy == "Forward-Starting IRS Hedge":
-            net_pnl = spread_pnl  # rate hedged, credit spread still exposed
-        elif strategy == "Deal-Contingent Hedge":
-            net_pnl = gross * (1 - close_prob)
+    if scenario.transaction_fails:
+        # No issuance, so no rate or spread exposure on debt that never exists.
+        # What remains is what each strategy is left holding.
+        if strategy == FORWARD_STARTING:
+            attribution[UNWIND] = -dv01 * bid_offer_bps
+            notes.append(
+                "The swap outlives the deal and must be unwound; at unchanged "
+                "rates the cost is the bid-offer."
+            )
+        elif strategy == DEAL_CONTINGENT:
+            notes.append("The hedge terminates with the transaction, at no breakage cost.")
         else:
-            net_pnl = gross
+            notes.append("Nothing was issued and nothing was hedged.")
+    else:
+        # Benchmark: borne in full when unhedged, neutralised when hedged.
+        if strategy == UNHEDGED:
+            attribution[BENCHMARK_RATE] = compute_rate_pnl(dv01, scenario.rate_shift_bps)
+        elif scenario.rate_shift_bps:
+            notes.append(
+                "The hedge offsets the benchmark move; the gain on the swap and "
+                "the higher coupon cancel."
+            )
 
-        scenarios.append({
-            "scenario": "Rates +25bps + Credit Spread +20bps",
-            "strategy": strategy,
-            "rate_shift_bps": rate_shift,
-            "credit_spread_shift_bps": spread_shift,
-            "dv01": dv01,
-            "gross_pnl": gross,
-            "net_pnl": net_pnl,
-            "note": "Synthetic assumptions — not extracted from agreement"
-        })
+        # Swap spread: only a hedger has this basis, because only a hedger
+        # holds an instrument priced off the swap rate.
+        if hedged and scenario.swap_spread_shift_bps:
+            attribution[SWAP_SPREAD] = -swap_spread_dv01 * scenario.swap_spread_shift_bps
 
-    # Transaction outcome scenarios
-    for outcome, prob, label in [
-        ("base_case_close", close_prob, "Base Case Close"),
-        ("transaction_failure", fail_prob, "Transaction Failure"),
-    ]:
-        for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
-            if outcome == "transaction_failure":
-                if strategy == "Forward-Starting IRS Hedge":
-                    # Unwind cost — assume 10bps breakage
-                    net_pnl = compute_rate_pnl(dv01, 10)
-                elif strategy == "Deal-Contingent Hedge":
-                    net_pnl = 0  # deal contingent hedge cancels on failure
-                else:
-                    net_pnl = 0
+        # Issuer credit spread: no rate hedge touches it. Every strategy bears
+        # it in full, which is the point of reporting it separately.
+        if scenario.credit_spread_shift_bps:
+            attribution[CREDIT_SPREAD] = -credit_dv01 * scenario.credit_spread_shift_bps
+            if hedged:
+                notes.append(
+                    "Neither hedge covers the issuer's own credit spread; this "
+                    "cost is identical to the unhedged case."
+                )
+
+        # Timing: a delay means the hedge has to be carried further.
+        if scenario.delay_days:
+            if strategy == FORWARD_STARTING:
+                attribution[TIMING] = -compute_carry_cost(
+                    notional, market["swap_rate"], market["treasury_rate"],
+                    scenario.delay_days,
+                )
+            elif strategy == DEAL_CONTINGENT:
+                notes.append("Extension is embedded; the premium already prices timing.")
             else:
-                net_pnl = 0
+                notes.append("Nothing is being carried; the issuance simply moves.")
 
-            scenarios.append({
-                "scenario": label,
+    # Completion: the deal-contingent premium is paid in every scenario,
+    # including the ones where the contingency is never used.
+    if strategy == DEAL_CONTINGENT:
+        attribution[COMPLETION] = -dv01 * premium_bps
+
+    # FX: a property of the transaction, not an assumption.
+    if deal.has_fx_exposure:
+        notes.append(
+            f"Unhedged FX exposure in {', '.join(deal.foreign_currencies)}: no FX "
+            "rate or volatility assumption is supplied, so it is reported as an "
+            "exposure rather than priced."
+        )
+    return attribution, notes
+
+
+def run_scenarios(assumptions=None, horizon=None, deal=None) -> list[ScenarioResult]:
+    """
+    Every required scenario against every required strategy.
+
+    `horizon` is Workstream 4's HedgeHorizon, which dates the delay scenarios.
+    `deal` carries the extracted currency facts that decide FX exposure.
+    """
+    assumptions = assumptions or BIO_TECHNE_ASSUMPTIONS
+    deal = deal or DealCharacteristics()
+
+    results: list[ScenarioResult] = []
+    for scenario in build_scenarios(assumptions, horizon):
+        for strategy in STRATEGIES:
+            unavailable = scenario.delay_days is None and scenario.scenario_id.startswith(
+                "delay_"
+            )
+            attribution, notes = (
+                ({factor: 0.0 for factor in RISK_FACTORS}, [])
+                if unavailable
+                else _attribute(scenario, strategy, assumptions, deal)
+            )
+            if scenario.note:
+                notes.insert(0, scenario.note)
+            results.append(
+                ScenarioResult(
+                    scenario_id=scenario.scenario_id,
+                    scenario=scenario.label,
+                    strategy=strategy,
+                    attribution=attribution,
+                    probability=scenario.probability,
+                    delay_days=scenario.delay_days,
+                    delayed_to=scenario.delayed_to,
+                    notes=notes,
+                )
+            )
+    return results
+
+
+def risk_exposures(assumptions=None, deal=None) -> list[dict]:
+    """
+    Per-basis-point sensitivity of each strategy to each risk.
+
+    The scenario tables show what happens in the seven cases the assignment
+    names; none of them moves the swap spread, and none prices FX. This is
+    where those exposures are still visible -- a risk a strategy carries but
+    no scenario happens to shock is still a risk it carries.
+    """
+    assumptions = assumptions or BIO_TECHNE_ASSUMPTIONS
+    deal = deal or DealCharacteristics()
+    market = assumptions["market"]
+    notional = assumptions["financing"]["expected_debt_issuance_usd"]
+    dv01 = compute_dv01(notional, market["benchmark_dv01_per_100mm"])
+
+    rows = []
+    for strategy in STRATEGIES:
+        hedged = strategy in (FORWARD_STARTING, DEAL_CONTINGENT)
+        rows.append(
+            {
                 "strategy": strategy,
-                "rate_shift_bps": 0,
-                "credit_spread_shift_bps": 0,
-                "dv01": dv01,
-                "gross_pnl": net_pnl,
-                "net_pnl": net_pnl,
-                "probability": prob,
-                "note": "Synthetic assumptions — not extracted from agreement"
-            })
-
-    # Timing scenarios, dated from the Workstream 4 timeline.
-    delays = _delay_scenarios(horizon)
-    if not delays:
-        for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
-            scenarios.append({
-                "scenario": "Closing delayed (no extension dates available)",
-                "strategy": strategy,
-                "rate_shift_bps": 0,
-                "credit_spread_shift_bps": 0,
-                "dv01": dv01,
-                "gross_pnl": None,
-                "net_pnl": None,
-                "delay_days": None,
-                "probability": delay_prob,
-                "note": "No extension dates on the timeline; no delay assumed.",
-            })
-        return scenarios
-
-    for label, delay_days, dated_to in delays:
-        carry = compute_carry_cost(notional, swap_rate, treasury_rate, delay_days)
-        for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
-            if strategy == "Forward-Starting IRS Hedge":
-                # The hedge has to be rolled to the later issuance date.
-                net_pnl = -carry
-            elif strategy == "Deal-Contingent Hedge":
-                # Extension is embedded; the premium already prices timing.
-                net_pnl = 0.0
-            else:
-                # Nothing to carry, but the issuance is exposed for longer.
-                net_pnl = 0.0
-
-            scenarios.append({
-                "scenario": label,
-                "strategy": strategy,
-                "rate_shift_bps": 0,
-                "credit_spread_shift_bps": 0,
-                "dv01": dv01,
-                "gross_pnl": net_pnl,
-                "net_pnl": net_pnl,
-                "delay_days": delay_days,
-                "delayed_to": dated_to,
-                "probability": delay_prob,
-                "note": (
-                    f"Delay of {delay_days} days to {dated_to}, from the extension "
-                    "clause via the Workstream 4 timeline (a calculated date). "
-                    "Carry priced on the synthetic swap spread."
+                BENCHMARK_RATE: 0.0 if hedged else -dv01,
+                SWAP_SPREAD: (
+                    -dv01 * ADDITIONAL_ASSUMPTIONS["swap_spread_dv01_ratio"][0]
+                    if hedged
+                    else 0.0
                 ),
-            })
+                CREDIT_SPREAD: -dv01 * ADDITIONAL_ASSUMPTIONS["credit_spread_dv01_ratio"][0],
+                FX: (
+                    f"exposed ({', '.join(deal.foreign_currencies)}), not priced"
+                    if deal.has_fx_exposure
+                    else "none"
+                ),
+                TIMING: "carry on delay" if strategy == FORWARD_STARTING else "none",
+                COMPLETION: (
+                    "premium paid in all cases"
+                    if strategy == DEAL_CONTINGENT
+                    else ("unwind exposure" if strategy == FORWARD_STARTING else "none")
+                ),
+                UNWIND: (
+                    "bid-offer on early unwind"
+                    if strategy == FORWARD_STARTING
+                    else "none (terminates)"
+                    if strategy == DEAL_CONTINGENT
+                    else "none"
+                ),
+            }
+        )
+    return rows
 
-    return scenarios
+
+def probability_weighted(results: list[ScenarioResult]) -> dict[str, float]:
+    """
+    Expected P&L per strategy across the outcome scenarios.
+
+    Only the scenarios carrying a probability are weighted -- the rate shocks
+    are sensitivities, not outcomes with a likelihood, and averaging them in
+    would mix two different questions.
+    """
+    weighted: dict[str, float] = {strategy: 0.0 for strategy in STRATEGIES}
+    for result in results:
+        if result.probability is None:
+            continue
+        weighted[result.strategy] += result.net_pnl * result.probability
+    return weighted
