@@ -250,6 +250,18 @@ def _red_if_negative(value) -> str:
     return f"color: {RED}" if isinstance(value, (int, float)) and value < 0 else ""
 
 
+def _page_cell(value) -> str:
+    """
+    A page number as text, never as a figure.
+
+    Pages arrive as a printed label ("A-47", "iii") or a PDF page integer. In
+    one pandas column the integers alone become float64, so page 3 renders as
+    "3.0000" and a missing page as "NaN". A page is an identifier, not a
+    quantity, so it is displayed as the string it is.
+    """
+    return "" if value is None else str(value)
+
+
 def _red_if_conflict(value) -> str:
     """Red on the classifications that need a human, and on no others."""
     return (
@@ -548,9 +560,9 @@ elif page.startswith("3"):
                                     "critical": c.is_critical,
                                     "classification": c.classification.replace("_", " "),
                                     "filing summary": _layer_cell(c.summary),
-                                    "summary p.": c.summary.page,
+                                    "summary p.": _page_cell(c.summary.page),
                                     "agreement": _layer_cell(c.agreement),
-                                    "agreement p.": c.agreement.page,
+                                    "agreement p.": _page_cell(c.agreement.page),
                                     # Two sources are compared, so two value
                                     # columns. The governing value is always a
                                     # copy of one of them; naming the layer that
@@ -615,7 +627,7 @@ elif page.startswith("3"):
                                 "ccy": r["currency"],
                                 "status": r["status"],
                                 "conf": r["confidence"],
-                                "page": r["printed_page"] or r["pdf_page"],
+                                "page": _page_cell(r["printed_page"] or r["pdf_page"]),
                                 "evidence ok": r["evidence_verified"],
                                 "review": r["review_status"],
                                 "run": r["run_id"],
@@ -696,7 +708,7 @@ elif page.startswith("4"):
                                 "derivation": e.derivation or "",
                                 "stated as": e.stated_as,
                                 "layer": e.layer,
-                                "p.": e.page,
+                                "p.": _page_cell(e.page),
                             }
                             for e in timeline.anchored
                         ]
@@ -730,7 +742,7 @@ elif page.startswith("4"):
                                 "stated as": e.stated_as,
                                 "trigger": e.trigger or "",
                                 "layer": e.layer,
-                                "p.": e.page,
+                                "p.": _page_cell(e.page),
                                 "review": e.review_status,
                             }
                             for e in timeline.unanchored
