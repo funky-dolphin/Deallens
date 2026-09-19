@@ -2,7 +2,15 @@
 hedging.py
 Workstream 5 - Hedging and Financing Analytics
 All inputs are synthetic assumptions unless extracted from the document.
+
+Timing comes from Workstream 4. The delay scenarios take their dates from the
+timeline's hedge horizon rather than deriving a close date here: the timeline
+already computes it from the agreement's extension clause and shows the
+arithmetic, and two modules deriving the same date from the same agreement is
+two chances to disagree about it.
 """
+
+from datetime import date
 
 
 # Default synthetic assumptions for Bio-Techne (from assignment)
@@ -44,9 +52,63 @@ def compute_rate_pnl(dv01, rate_shift_bps):
     return -dv01 * rate_shift_bps
 
 
-def run_scenarios(assumptions=None):
+def compute_carry_cost(notional_usd, swap_rate, treasury_rate, delay_days):
+    """
+    Cost of carrying a forward-starting hedge across a closing delay.
+
+    A hedge struck for an expected issuance date has to be rolled when closing
+    slips. The carry is approximated as the swap spread -- the swap rate over
+    the benchmark -- applied to the notional for the length of the delay:
+
+        notional x (swap_rate - treasury_rate) x delay_days / 365
+
+    This is the first use the swap spread has been put to; it was previously
+    read from the assumptions and never referenced. The figure is an
+    approximation and is labelled as a calculation, not an extracted fact.
+    """
+    return notional_usd * (swap_rate - treasury_rate) * (delay_days / 365.0)
+
+
+def _delay_scenarios(horizon):
+    """
+    The two delay scenarios the assignment requires, dated from the timeline.
+
+    Returns (label, delay_days, dated_to) triples. The dates come from
+    Workstream 4's horizon rather than being derived again here: two modules
+    computing a close date from the same agreement is two chances to disagree
+    about it, and the timeline is the one that shows its arithmetic.
+
+    With no horizon, or one without calculated extension dates, no delay is
+    assumed. An invented delay would put a fabricated timing cost in front of
+    someone sizing a hedge.
+    """
+    if horizon is None or not horizon.outside_date or not horizon.extension_dates:
+        return []
+
+    outside = date.fromisoformat(horizon.outside_date)
+    dates = horizon.extension_dates
+    chosen = [("first", dates[0])]
+    if len(dates) > 1:
+        chosen.append(("final", dates[-1]))
+
+    return [
+        (
+            f"Closing delayed to {which} extension date",
+            (date.fromisoformat(when) - outside).days,
+            when,
+        )
+        for which, when in chosen
+    ]
+
+
+def run_scenarios(assumptions=None, horizon=None):
     """
     Run all required hedging scenarios.
+
+    `horizon` is Workstream 4's HedgeHorizon. When supplied, the delay
+    scenarios use its extension dates and say how many days each represents;
+    without it they are reported as unavailable rather than assumed.
+
     Returns a list of scenario result dicts.
     """
     if assumptions is None:
@@ -126,8 +188,7 @@ def run_scenarios(assumptions=None):
     # Transaction outcome scenarios
     for outcome, prob, label in [
         ("base_case_close", close_prob, "Base Case Close"),
-        ("delayed_close", delay_prob, "Delayed Close"),
-        ("transaction_failure", fail_prob, "Transaction Failure")
+        ("transaction_failure", fail_prob, "Transaction Failure"),
     ]:
         for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
             if outcome == "transaction_failure":
@@ -139,7 +200,7 @@ def run_scenarios(assumptions=None):
                 else:
                     net_pnl = 0
             else:
-                net_pnl = 0  # simplified — timing cost omitted
+                net_pnl = 0
 
             scenarios.append({
                 "scenario": label,
@@ -151,6 +212,55 @@ def run_scenarios(assumptions=None):
                 "net_pnl": net_pnl,
                 "probability": prob,
                 "note": "Synthetic assumptions — not extracted from agreement"
+            })
+
+    # Timing scenarios, dated from the Workstream 4 timeline.
+    delays = _delay_scenarios(horizon)
+    if not delays:
+        for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
+            scenarios.append({
+                "scenario": "Closing delayed (no extension dates available)",
+                "strategy": strategy,
+                "rate_shift_bps": 0,
+                "credit_spread_shift_bps": 0,
+                "dv01": dv01,
+                "gross_pnl": None,
+                "net_pnl": None,
+                "delay_days": None,
+                "probability": delay_prob,
+                "note": "No extension dates on the timeline; no delay assumed.",
+            })
+        return scenarios
+
+    for label, delay_days, dated_to in delays:
+        carry = compute_carry_cost(notional, swap_rate, treasury_rate, delay_days)
+        for strategy in ["Unhedged", "Forward-Starting IRS Hedge", "Deal-Contingent Hedge"]:
+            if strategy == "Forward-Starting IRS Hedge":
+                # The hedge has to be rolled to the later issuance date.
+                net_pnl = -carry
+            elif strategy == "Deal-Contingent Hedge":
+                # Extension is embedded; the premium already prices timing.
+                net_pnl = 0.0
+            else:
+                # Nothing to carry, but the issuance is exposed for longer.
+                net_pnl = 0.0
+
+            scenarios.append({
+                "scenario": label,
+                "strategy": strategy,
+                "rate_shift_bps": 0,
+                "credit_spread_shift_bps": 0,
+                "dv01": dv01,
+                "gross_pnl": net_pnl,
+                "net_pnl": net_pnl,
+                "delay_days": delay_days,
+                "delayed_to": dated_to,
+                "probability": delay_prob,
+                "note": (
+                    f"Delay of {delay_days} days to {dated_to}, from the extension "
+                    "clause via the Workstream 4 timeline (a calculated date). "
+                    "Carry priced on the synthetic swap spread."
+                ),
             })
 
     return scenarios

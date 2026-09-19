@@ -50,6 +50,7 @@ from deallens.extraction import (
     extract_document,
 )
 from deallens.ingestion import ingest
+from deallens.timeline import build_timeline
 
 load_dotenv()
 
@@ -159,9 +160,10 @@ with st.sidebar:
             "1 · Ingest & inspect",
             "2 · Extract",
             "3 · Summary vs. agreement",
-            "4 · Review queue",
-            "5 · Hedging analysis",
-            "6 · Q&A",
+            "4 · Timeline & risk map",
+            "5 · Review queue",
+            "6 · Hedging analysis",
+            "7 · Q&A",
         ],
     )
     st.divider()
@@ -500,8 +502,135 @@ elif page.startswith("3"):
             )
 
 
-# ── 4 · Review queue ──────────────────────────────────────────────────────────
+# ── 4 · Timeline & risk map ───────────────────────────────────────────────────
 elif page.startswith("4"):
+    st.title("Timeline & risk map")
+    st.caption(
+        "Dates the agreement fixes, dates it derives, and dates it only "
+        "describes. Entries with no calendar position are kept out of the "
+        "ordered timeline rather than being given one."
+    )
+
+    document_id = _doc_picker()
+    if document_id:
+        rows = get_extracted_fields(conn, document_id)
+        if not rows:
+            st.info("Nothing extracted for this document yet. See **Extract**.")
+        else:
+            timeline = build_timeline(rows)
+            horizon = timeline.horizon
+
+            st.subheader("Hedge horizon")
+            if horizon.is_complete:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Signing", horizon.signing_date)
+                c2.metric("Outside date", horizon.outside_date)
+                c3.metric(
+                    "Window",
+                    f"{horizon.base_days} d",
+                    delta=(
+                        f"+{horizon.extension_days} d extendable"
+                        if horizon.extension_days
+                        else None
+                    ),
+                    delta_color="off",
+                )
+                c4.metric("Conditions outstanding", horizon.outstanding_conditions)
+                if horizon.final_outside_date:
+                    st.caption(
+                        f"Worst case close **{horizon.final_outside_date}** — "
+                        f"{horizon.total_days} days from signing."
+                    )
+            else:
+                st.warning(
+                    "No hedge horizon could be built: the timeline has no fixed "
+                    "signing and outside date pair."
+                )
+            for note in horizon.notes:
+                st.caption(f"· {note}")
+
+            st.subheader(f"Dated timeline ({len(timeline.anchored)})")
+            if timeline.anchored:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "date": e.resolved_date,
+                                "event": e.event,
+                                "kind": e.kind.replace("_", " "),
+                                "basis": e.basis,
+                                "derivation": e.derivation or "",
+                                "stated as": e.stated_as,
+                                "layer": e.layer,
+                                "p.": e.page,
+                            }
+                            for e in timeline.anchored
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+                if timeline.calculated:
+                    st.caption(
+                        f"{len(timeline.calculated)} date(s) marked `calculated` are "
+                        "derived from the agreement's extension clause by arithmetic "
+                        "— the document does not state them in those words. The "
+                        "derivation column shows the working."
+                    )
+            else:
+                st.info("No entry resolved to a calendar date.")
+
+            st.subheader(f"Conditional, relative and estimated ({len(timeline.unanchored)})")
+            st.caption(
+                "These have no fixed position: each depends on an event, a "
+                "condition, a party's election, or is a non-binding estimate."
+            )
+            if timeline.unanchored:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "event": e.event,
+                                "section": e.section,
+                                "kind": e.kind.replace("_", " "),
+                                "stated as": e.stated_as,
+                                "trigger": e.trigger or "",
+                                "layer": e.layer,
+                                "p.": e.page,
+                                "review": e.review_status,
+                            }
+                            for e in timeline.unanchored
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            with st.expander("Evidence for every timeline entry"):
+                for entry in timeline.anchored + timeline.unanchored:
+                    st.markdown(
+                        f"**{entry.event}** — `{entry.kind}` · `{entry.basis}`"
+                        + (f" · derived: {entry.derivation}" if entry.derivation else "")
+                    )
+                    if entry.evidence:
+                        st.caption(f"“{entry.evidence}”")
+                    st.caption(
+                        f"{entry.layer or 'no layer'} · page {entry.page} · "
+                        f"{entry.section_ref or 'no section'}"
+                    )
+                    if entry.locator_uri:
+                        st.code(entry.locator_uri, language=None)
+
+            st.download_button(
+                "Download timeline (JSON)",
+                data=json.dumps(timeline.to_dict(), indent=2, default=str),
+                file_name=f"{document_id}_timeline.json",
+                mime="application/json",
+            )
+
+
+# ── 5 · Review queue ──────────────────────────────────────────────────────────
+elif page.startswith("5"):
     st.title("Review queue")
     st.caption(
         "Fields the pipeline declined to assert: below the confidence threshold, "
@@ -544,10 +673,33 @@ elif page.startswith("4"):
                     st.rerun()
 
 
-# ── 5 · Hedging analysis ──────────────────────────────────────────────────────
-elif page.startswith("5"):
+# ── 6 · Hedging analysis ──────────────────────────────────────────────────────
+elif page.startswith("6"):
     st.title("Hedging & financing analysis")
     st.caption("All market and financing inputs below are **synthetic assumptions**.")
+
+    # Timing is not an assumption -- it comes from the agreement, via the
+    # Workstream 4 timeline. Selecting a document here is what lets the delay
+    # scenarios be dated instead of stubbed.
+    horizon = None
+    document_id = _doc_picker("Date the delay scenarios from")
+    if document_id:
+        rows = get_extracted_fields(conn, document_id)
+        if rows:
+            horizon = build_timeline(rows).horizon
+    if horizon is not None and horizon.extension_dates:
+        st.caption(
+            f"Delay scenarios dated from the timeline: outside date "
+            f"`{horizon.outside_date}`, extensions to "
+            f"{', '.join(f'`{d}`' for d in horizon.extension_dates)} "
+            "(calculated from the extension clause)."
+        )
+    else:
+        st.caption(
+            "No extension dates available for this document, so no closing "
+            "delay is assumed. The delay scenarios report as unavailable "
+            "rather than being given an invented length."
+        )
 
     with st.expander("Assumptions", expanded=False):
         c1, c2, c3 = st.columns(3)
@@ -559,7 +711,7 @@ elif page.startswith("5"):
         c3.json(BIO_TECHNE_ASSUMPTIONS["transaction"])
 
     if st.button("Run scenarios", type="primary"):
-        df = pd.DataFrame(run_scenarios())
+        df = pd.DataFrame(run_scenarios(horizon=horizon))
 
         st.subheader("Scenario results")
         st.dataframe(
@@ -570,6 +722,7 @@ elif page.startswith("5"):
                     "rate_shift_bps",
                     "credit_spread_shift_bps",
                     "dv01",
+                    "delay_days",
                     "net_pnl",
                 ]
             ].style.format({"dv01": "${:,.0f}", "net_pnl": "${:,.0f}"}),
@@ -584,8 +737,8 @@ elif page.startswith("5"):
         st.dataframe(pivot.style.format("${:,.0f}"), width="stretch")
 
 
-# ── 6 · Q&A ───────────────────────────────────────────────────────────────────
-elif page.startswith("6"):
+# ── 7 · Q&A ───────────────────────────────────────────────────────────────────
+elif page.startswith("7"):
     st.title("Document Q&A")
     st.caption("Answers are grounded in the extracted fields only, with citations.")
 
