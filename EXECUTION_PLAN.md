@@ -107,6 +107,8 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 
 Note: On Streamlit Cloud the in-memory SQLite resets on each browser session — this is by design. Each user gets a clean isolated session.
 
+For local development, set `DEALLENS_DB` to a path (e.g. `DEALLENS_DB=deallens.db`) to keep that database on disk. A refresh starts a new Streamlit session and discards an in-memory database along with the extraction it holds, and re-running an extraction is the only step that spends money. With a file-backed database everything downstream of extraction stays browsable across refreshes; a new extraction still needs a re-ingest first, which is local and free. Leave it unset on a shared deployment, where one file would be one database shared by every visitor. The sidebar reports which mode is active.
+
 ---
 
 ## Repository layout

@@ -57,12 +57,25 @@ st.set_page_config(page_title="DealLens", page_icon="🔍", layout="wide")
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-# One in-memory database per browser session, so concurrent users cannot see
-# one another's documents. The IngestionResult objects are held in session
-# state too: the database records what ingestion found, but extraction needs
-# the live object (page text, layer boundaries) and the original bytes.
+# By default the database is in-memory and per browser session, so concurrent
+# users on a deployment cannot see one another's documents.
+#
+# Set DEALLENS_DB to a path to keep it on disk instead. That is a development
+# convenience with a real cost, so it is opt-in rather than the default: a
+# refresh starts a new Streamlit session and discards session state, which
+# discards an in-memory database along with the extraction it holds -- and
+# re-running that extraction is the one step in this pipeline that spends
+# money. On a file-backed database, everything downstream of extraction stays
+# browsable across refreshes. Do not set it on a shared deployment, where one
+# file would be one database shared by every visitor.
+DB_PATH = os.getenv("DEALLENS_DB") or ":memory:"
+
+# The IngestionResult objects are held in session state whichever mode is in
+# use: the database records what ingestion found, but extraction needs the
+# live object (page text, layer boundaries) and the original bytes. Those are
+# cheap to rebuild -- re-ingesting is local and free.
 if "db" not in st.session_state:
-    st.session_state.db = initialize_schema(get_connection())
+    st.session_state.db = initialize_schema(get_connection(DB_PATH))
     st.session_state.ingestions = {}
     st.session_state.pdf_bytes = {}
 
@@ -118,6 +131,13 @@ with st.sidebar:
     st.divider()
     st.caption(f"model `{MODEL_ID}`")
     st.caption(f"prompt `{PROMPT_VERSION}`")
+    if DB_PATH == ":memory:":
+        st.caption(
+            "storage `in-memory` — a page refresh discards extracted fields. "
+            "Set `DEALLENS_DB` to keep them."
+        )
+    else:
+        st.caption(f"storage `{DB_PATH}` — survives a refresh")
 
 
 # ── 1 · Ingest & inspect ──────────────────────────────────────────────────────
@@ -300,7 +320,14 @@ elif page.startswith("3"):
             st.caption(
                 "Source hierarchy: on a conflict the operative agreement governs, "
                 "because it is the executed contract and the filing summary is a "
-                "description of it. The summary's value is preserved either way."
+                "description of it. The summary's value is preserved either way, "
+                "and the governing value is shown with the page it came from."
+            )
+            st.caption(
+                "`critical` marks fields the assignment forbids inferring silently — "
+                "they are held to a higher confidence bar and routed to review on any "
+                "conflict. It describes the field, not the result: a critical field "
+                "that matches is in good shape."
             )
 
             default_classes = [
@@ -328,13 +355,24 @@ elif page.startswith("3"):
                             [
                                 {
                                     "field": c.field_name,
-                                    "!": "⚠️" if c.is_critical else "",
+                                    # A property of the field, not of the
+                                    # comparison: critical fields are held to a
+                                    # higher confidence bar. It is deliberately
+                                    # not a warning icon -- a critical field
+                                    # that matches is in good shape.
+                                    "critical": c.is_critical,
                                     "classification": c.classification.replace("_", " "),
                                     "filing summary": c.summary.normalized_value,
-                                    "p.": c.summary.page,
+                                    "summary p.": c.summary.page,
                                     "agreement": c.agreement.normalized_value,
-                                    "p. ": c.agreement.page,
+                                    "agreement p.": c.agreement.page,
                                     "governing value": c.preferred_value,
+                                    "governing p.": c.preferred_page,
+                                    "governed by": (
+                                        c.preferred_layer.split("-ex")[0]
+                                        if c.preferred_layer
+                                        else None
+                                    ),
                                 }
                                 for c in items
                             ]
@@ -348,10 +386,10 @@ elif page.startswith("3"):
             if needs_attention:
                 st.subheader(f"Conflicts and unresolved fields ({len(needs_attention)})")
                 for comparison in needs_attention:
-                    label = "⚠️ " if comparison.is_critical else ""
+                    label = " · critical field" if comparison.is_critical else ""
                     with st.expander(
-                        f"{label}`{comparison.field_name}` — "
-                        f"{comparison.classification.replace('_', ' ')}"
+                        f"`{comparison.field_name}` — "
+                        f"{comparison.classification.replace('_', ' ')}{label}"
                     ):
                         st.write(comparison.reason)
                         for title, reading in (

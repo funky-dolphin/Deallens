@@ -216,6 +216,41 @@ def test_the_agreement_governs_a_conflict_without_discarding_the_summary():
     assert result.summary.normalized_value == "2027-01-01", "the summary reading survives"
 
 
+def test_the_governing_value_carries_its_own_page_and_locator():
+    """
+    A value the pipeline puts forward as the answer must be citable. Reporting
+    a governing value with no page is the one output shape this project exists
+    to avoid, and it is easy to reintroduce by reading `preferred_value` alone.
+    """
+    result = compare_field(
+        "company_termination_fee",
+        _reading(250_000_000.0, "$250 million", layer="filing-summary",
+                 page="3", section="Item 1.01", locator_uri="deallens://doc/p3"),
+        _reading(255_000_000.0, "$255,000,000", layer="agreement-ex2.1",
+                 page="A-47", section="Section 7.02", locator_uri="deallens://doc/p47"),
+    )
+    assert result.preferred_value == 255_000_000.0
+    assert result.preferred_page == "A-47"
+    assert result.preferred_locator == "deallens://doc/p47"
+
+    payload = result.to_dict()
+    assert payload["preferred_page"] == "A-47"
+    assert payload["preferred_section"] == "Section 7.02"
+    assert payload["preferred_locator"] == "deallens://doc/p47"
+
+
+def test_a_comparison_with_no_governing_value_has_no_page():
+    """The page must come from a reading, never from a default."""
+    result = compare_field(
+        "bridge_amount",
+        LayerReading(layer="filing-summary", status=models.NOT_FOUND),
+        LayerReading(layer="agreement", status=models.NOT_FOUND),
+    )
+    assert result.preferred_value is None
+    assert result.preferred_page is None
+    assert result.preferred_locator is None
+
+
 def test_a_one_sided_field_prefers_the_layer_that_has_it():
     result = compare_field(
         "total_transaction_value",

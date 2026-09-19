@@ -111,10 +111,23 @@ class FieldComparison:
     agreement: LayerReading = dataclass_field(default_factory=LayerReading)
     preferred_layer: str | None = None
     preferred_value: object | None = None
+    # The reading the hierarchy nominated, kept whole so the governing value
+    # carries its own page and locator. A value the pipeline puts forward as
+    # the answer without a citation is the one thing this project is built not
+    # to produce.
+    preferred_reading: LayerReading | None = None
 
     @property
     def needs_review(self) -> bool:
         return self.classification in {CONFLICT, UNRESOLVED}
+
+    @property
+    def preferred_page(self) -> object | None:
+        return self.preferred_reading.page if self.preferred_reading else None
+
+    @property
+    def preferred_locator(self) -> str | None:
+        return self.preferred_reading.locator_uri if self.preferred_reading else None
 
     def to_dict(self) -> dict:
         """Flat, JSON-safe shape for export and for the UI table."""
@@ -126,6 +139,11 @@ class FieldComparison:
             "reason": self.reason,
             "preferred_layer": self.preferred_layer,
             "preferred_value": self.preferred_value,
+            "preferred_page": self.preferred_page,
+            "preferred_section": (
+                self.preferred_reading.section if self.preferred_reading else None
+            ),
+            "preferred_locator": self.preferred_locator,
             "summary_value": self.summary.normalized_value,
             "summary_raw": self.summary.raw_value,
             "summary_page": self.summary.page,
@@ -287,6 +305,7 @@ def compare_field(
         # conflicts, so the hierarchy is visible rather than implied.
         comparison.preferred_layer = agreement.layer or LAYER_AGREEMENT
         comparison.preferred_value = agreement.normalized_value
+        comparison.preferred_reading = agreement
         return comparison
 
     if summary_ok:
@@ -298,6 +317,7 @@ def compare_field(
         )
         comparison.preferred_layer = summary.layer or LAYER_FILING_SUMMARY
         comparison.preferred_value = summary.normalized_value
+        comparison.preferred_reading = summary
         return comparison
 
     if agreement_ok:
@@ -305,6 +325,7 @@ def compare_field(
         comparison.reason = "Only the agreement supports a value."
         comparison.preferred_layer = agreement.layer or LAYER_AGREEMENT
         comparison.preferred_value = agreement.normalized_value
+        comparison.preferred_reading = agreement
         return comparison
 
     # Neither side yielded a usable value. Whether that is an absence or a
