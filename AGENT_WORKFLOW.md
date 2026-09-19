@@ -44,12 +44,19 @@ review pages the new controls made possible.
 ## Extraction Prompt Design
 
 The extraction prompt was designed to:
-1. Request a **JSON array** (not object) so it can be iterated directly
-2. Require **evidence quotes** (max 200 chars) for every field — enables grounded Q&A
+1. Hold the model to an **output schema** keyed by field name, so an omitted
+   field is detected per field rather than corrupting the whole response
+2. Require **evidence quotes** for every field — these are verified against the
+   page they cite, so a quote that is not there withholds the value
 3. Require **page numbers** — critical for analyst verification
-4. Require **confidence scores** — flags uncertain extractions for human review
-5. Cover all 25+ fields specified in the assignment across 5 categories
-6. Instruct returning `null` with `confidence: 0.0` when a field isn't found — avoids hallucination
+4. Require **confidence scores** — checked against a threshold that is higher
+   for critical fields
+5. Cover the 50 registry fields across 6 categories, narrowed to those that
+   apply to the detected transaction structure
+6. Instruct returning not-found rather than a guess when a field isn't present
+
+The prompt is versioned (`PROMPT_VERSION`) and stamped on every extracted row,
+so a result can be tied to the logic that produced it.
 
 ---
 
@@ -97,4 +104,8 @@ remaining layers still extract.
 
 **API failure**: Caught by generic `except Exception` in extractor. Error bubbled to UI.
 
-**Empty extraction**: Fields with `normalized_value: null` are stored with `confidence: 0.0`. Q&A prompt filters these out: `if f['normalized_value'] and f['normalized_value'] != 'null'`.
+**Withheld value**: a field that was found but failed normalization, evidence
+verification or the confidence threshold keeps its raw value and evidence so a
+human can adjudicate, but its normalized value is not asserted. It is routed to
+the review queue. Q&A only ever sees fields whose status is `found`, so a
+withheld value cannot be laundered into an answer.
