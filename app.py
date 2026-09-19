@@ -61,6 +61,7 @@ from deallens.extraction import (
     extract_document,
 )
 from deallens.ingestion import ingest
+from deallens.qa import PRESET_QUESTIONS, answer_question
 from deallens.timeline import build_timeline
 
 load_dotenv()
@@ -856,23 +857,14 @@ elif page.startswith("7"):
 
     document_id = _doc_picker()
     if document_id:
-        preset = [
-            "What is the consideration per share?",
-            "What approval, tender, or acceptance threshold applies?",
-            "What is the outside or long-stop date?",
-            "How may that date be extended?",
-            "What termination fees apply?",
-            "What triggers each fee?",
-            "How are options, RSUs, PSUs, and other awards treated?",
-            "What regulatory approvals are required?",
-            "Is there a financing condition?",
-            "What financing arrangements are disclosed?",
-            "What remedy or burdensome-condition limitations apply?",
-            "Which provisions are most relevant to a deal-contingent hedge?",
-        ]
-        question = st.selectbox("Preset question", preset)
-        custom = st.text_input("Or ask your own")
-        final_question = custom or question
+        question = st.selectbox("Preset question", PRESET_QUESTIONS)
+        custom = st.text_input(
+            "Or ask your own",
+            placeholder="e.g. What happens to PSUs granted before the agreement date?",
+        )
+        final_question = custom.strip() or question
+        if custom.strip():
+            st.caption(f"Asking your question: “{custom.strip()}”")
 
         if st.button("Ask", type="primary"):
             if not api_key:
@@ -881,50 +873,25 @@ elif page.startswith("7"):
                     "or in Streamlit secrets when deployed."
                 )
             else:
-                rows = [
-                    r
-                    for r in get_extracted_fields(conn, document_id)
-                    if r["status"] == "found" and r["normalized_value"] is not None
-                ]
-                if not rows:
-                    st.warning(
-                        "No asserted fields for this document — every extraction was withheld "
-                        "or the document has not been extracted yet."
-                    )
-                else:
-                    context = "\n".join(
-                        f"{r['field_name']}: {r['normalized_value']} "
-                        f"[layer {r['document_layer']}, page "
-                        f"{r['printed_page'] or r['pdf_page']}, confidence {r['confidence']:.2f}] "
-                        f"evidence: \"{r['evidence']}\""
-                        for r in rows
-                    )
-                    prompt = (
-                        "You are a derivatives analyst answering questions about a "
-                        "transaction agreement.\n\n"
-                        "Answer using ONLY the extracted data below. If the answer is not "
-                        "supported by it, say: \"I could not identify sufficient source "
-                        "support for this answer.\"\n\n"
-                        "For each answer give: the direct answer; the supporting evidence "
-                        "quote; the layer and page reference; and whether the statement is "
-                        "a fact, an assumption, or analysis.\n\n"
-                        f"EXTRACTED DATA:\n{context}\n\n"
-                        f"QUESTION: {final_question}"
-                    )
+                rows = get_extracted_fields(conn, document_id)
+                with st.spinner("Querying…"):
                     # Q&A always runs on the default model. The extraction
-                    # toggle scopes to extraction on purpose: answering here
-                    # costs a fraction of a run, and holding the answer model
-                    # fixed keeps a cheaper extraction's effect visible in the
+                    # toggle scopes to extraction on purpose: answering costs
+                    # a fraction of a run, and holding the answer model fixed
+                    # keeps a cheaper extraction's effect visible in the
                     # answers rather than confounded with a cheaper answerer.
-                    with st.spinner("Querying…"):
-                        response = _anthropic_client(api_key).messages.create(
-                            model=DEFAULT_MODEL_ID,
-                            max_tokens=2048,
-                            messages=[{"role": "user", "content": prompt}],
-                        )
-                    st.markdown("### Answer")
-                    st.markdown(response.content[0].text)
-                    st.caption(
-                        f"{len(rows)} asserted fields used as context · "
-                        f"model `{DEFAULT_MODEL_ID}`"
+                    answer = answer_question(
+                        _anthropic_client(api_key), final_question, rows
                     )
+
+                st.markdown("### Answer")
+                if answer.text:
+                    st.markdown(answer.text)
+                else:
+                    st.error("No answer was returned.")
+                for warning in answer.warnings:
+                    st.warning(warning)
+                st.caption(
+                    f"{answer.fields_used} asserted field(s) used as context · "
+                    f"model `{answer.model_id}` · prompt `{PROMPT_VERSION}`"
+                )
