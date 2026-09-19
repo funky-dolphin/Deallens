@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from deallens.analytics.hedging import BIO_TECHNE_ASSUMPTIONS, run_scenarios
 from deallens.comparison import (
     CLASS_ORDER,
+    CONFLICT,
     NOT_APPLICABLE,
     classification_counts,
     compare_layers,
@@ -320,8 +321,9 @@ elif page.startswith("3"):
             st.caption(
                 "Source hierarchy: on a conflict the operative agreement governs, "
                 "because it is the executed contract and the filing summary is a "
-                "description of it. The summary's value is preserved either way, "
-                "and the governing value is shown with the page it came from."
+                "description of it. `governed by` names the layer that wins; both "
+                "values, pages and quotes are kept either way, and the export "
+                "carries the governing value with its own page and locator."
             )
             st.caption(
                 "`critical` marks fields the assignment forbids inferring silently — "
@@ -366,12 +368,17 @@ elif page.startswith("3"):
                                     "summary p.": c.summary.page,
                                     "agreement": c.agreement.normalized_value,
                                     "agreement p.": c.agreement.page,
-                                    "governing value": c.preferred_value,
-                                    "governing p.": c.preferred_page,
+                                    # Two sources are compared, so two value
+                                    # columns. The governing value is always a
+                                    # copy of one of them; naming the layer that
+                                    # governs says the same thing without
+                                    # presenting it as a third reading. Only a
+                                    # conflict actually needs it -- everywhere
+                                    # else there is nothing to choose between.
                                     "governed by": (
-                                        c.preferred_layer.split("-ex")[0]
-                                        if c.preferred_layer
-                                        else None
+                                        c.preferred_layer
+                                        if c.classification == CONFLICT
+                                        else ""
                                     ),
                                 }
                                 for c in items
