@@ -504,6 +504,53 @@ def test_a_response_with_no_fields_list_is_not_silently_empty():
     assert any("no 'fields' list" in w for w in warnings)
 
 
+# ---------------------------------------------------------------------------
+# Model selection
+# ---------------------------------------------------------------------------
+
+def test_the_model_that_ran_is_stamped_on_the_run_and_every_field(ingested, composite_pdf):
+    """
+    Workstream 8 requires an output be traceable to the model that made it,
+    so a field must not claim the default when another model produced it.
+    """
+    client = FakeClient()
+    run = extract_document(client, ingested, composite_pdf, model_id="claude-sonnet-5")
+
+    assert run.model_id == "claude-sonnet-5"
+    stamped = {f.model_id for f in run.fields if f.extraction_method == "llm"}
+    assert stamped == {"claude-sonnet-5"}
+
+
+def test_the_selected_model_is_the_one_called(ingested, composite_pdf):
+    client = FakeClient()
+    extract_document(client, ingested, composite_pdf, model_id="claude-sonnet-5")
+    assert client.prompts[0]["model"] == "claude-sonnet-5"
+
+
+def test_the_estimate_is_priced_for_the_model_that_will_run(ingested):
+    """The estimate feeds the spend ceiling, so it has to use the right rates."""
+    from deallens.extraction.extractor import estimate_run
+
+    opus = estimate_run(ingested, model_id="claude-opus-5")
+    sonnet = estimate_run(ingested, model_id="claude-sonnet-5")
+
+    assert opus.cost_high > sonnet.cost_high
+    assert opus.input_tokens == sonnet.input_tokens, "same request, different rates"
+
+
+def test_an_unknown_model_is_refused_rather_than_defaulted():
+    from deallens.extraction.client import profile_for
+
+    with pytest.raises(ValueError, match="Unknown model"):
+        profile_for("claude-opus-4-5")
+
+
+def test_the_default_model_is_unchanged_when_none_is_given(ingested, composite_pdf):
+    client = FakeClient()
+    run = extract_document(client, ingested, composite_pdf)
+    assert run.model_id == "claude-opus-5"
+
+
 def test_required_output_schema_matches_the_assignment():
     record = ExtractedField(
         field_name="consideration_per_share", document_id="bio_techne", run_id="run-1",

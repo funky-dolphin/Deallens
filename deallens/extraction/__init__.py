@@ -1,6 +1,13 @@
 """Structured transaction extraction (Workstream 2)."""
 
-from .client import MODEL_ID, slice_pdf
+from .client import (
+    DEFAULT_MODEL_ID,
+    MODEL_ID,
+    MODEL_PROFILES,
+    ModelProfile,
+    profile_for,
+    slice_pdf,
+)
 from .extractor import ExtractionRun, LayerExtraction, extract_document, extract_layer
 from .models import ExtractedField, finalise, not_applicable_field, validate
 from .prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_output_schema, build_user_prompt
@@ -10,7 +17,11 @@ __all__ = [
     "BY_NAME",
     "CRITICAL_FIELDS",
     "FIELDS",
+    "DEFAULT_MODEL_ID",
     "MODEL_ID",
+    "MODEL_PROFILES",
+    "ModelProfile",
+    "profile_for",
     "PROMPT_VERSION",
     "SYSTEM_PROMPT",
     "ExtractedField",

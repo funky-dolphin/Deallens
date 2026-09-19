@@ -15,10 +15,6 @@ from io import BytesIO
 
 from pypdf import PdfReader, PdfWriter
 
-# Recorded on every extracted field. Workstream 8 requires an output be
-# traceable to the model that produced it.
-MODEL_ID = "claude-opus-5"
-
 # The full field set with evidence quotes runs to roughly 20k output tokens;
 # streaming avoids HTTP timeouts at this size and is required by the SDK for
 # large ceilings.
@@ -28,11 +24,47 @@ MAX_OUTPUT_TOKENS = 32_000
 MAX_PAGES_PER_PDF_REQUEST = 600
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
-# Claude Opus 5 context window. In text mode this, not a page count, is the
-# binding constraint -- an important distinction, because page size varies by
-# more than 20x within a single filing (217 to 4,379 characters on the
-# development document), so a page-count limit corresponds to no particular
-# quantity of content.
+
+@dataclass(frozen=True)
+class ModelProfile:
+    """A model offered for extraction, and what it costs."""
+
+    model_id: str
+    label: str
+    input_usd_per_mtok: float
+    output_usd_per_mtok: float
+
+
+# Both take the same request shape -- 1M context, adaptive thinking, effort --
+# so choosing between them is a price decision and nothing else. Pricing still
+# has to follow the choice, because the estimate feeds the spend ceiling.
+MODEL_PROFILES: dict[str, ModelProfile] = {
+    "claude-opus-5": ModelProfile("claude-opus-5", "Opus 5", 5.00, 25.00),
+    "claude-sonnet-5": ModelProfile("claude-sonnet-5", "Sonnet 5 (2.5x cheaper)", 2.00, 10.00),
+}
+
+# Recorded on every extracted field: Workstream 8 requires an output be
+# traceable to the model that produced it, so whichever model ran is stamped.
+DEFAULT_MODEL_ID = "claude-opus-5"
+MODEL_ID = DEFAULT_MODEL_ID
+
+
+def profile_for(model_id: str | None = None) -> ModelProfile:
+    """The profile for a model id, refusing anything unrecognised."""
+    resolved = model_id or DEFAULT_MODEL_ID
+    if resolved not in MODEL_PROFILES:
+        raise ValueError(
+            f"Unknown model {resolved!r}. Extraction is configured for: "
+            f"{', '.join(sorted(MODEL_PROFILES))}."
+        )
+    return MODEL_PROFILES[resolved]
+
+
+# In text mode the context window, not a page count, is the binding
+# constraint -- an important distinction, because page size varies by more
+# than 20x within a single filing (217 to 4,379 characters on the development
+# document), so a page-count limit corresponds to no particular quantity of
+# content.
 CONTEXT_WINDOW_TOKENS = 1_000_000
 
 # Characters per token for dense legal prose, measured on the development
@@ -48,9 +80,11 @@ CHARS_PER_TOKEN = 2.9
 # possible, but never one that overflows.
 CONTEXT_SAFETY_MARGIN = 0.85
 
-# Claude Opus 5 list pricing, USD per million tokens.
-INPUT_USD_PER_MTOK = 5.00
-OUTPUT_USD_PER_MTOK = 25.00
+# Default (Opus 5) list pricing, USD per million tokens. Pricing for a run is
+# taken from its ModelProfile; these remain for callers that only ever price
+# the default.
+INPUT_USD_PER_MTOK = MODEL_PROFILES[DEFAULT_MODEL_ID].input_usd_per_mtok
+OUTPUT_USD_PER_MTOK = MODEL_PROFILES[DEFAULT_MODEL_ID].output_usd_per_mtok
 
 
 def estimate_tokens(char_count: int) -> int:
@@ -58,14 +92,14 @@ def estimate_tokens(char_count: int) -> int:
     return int(char_count / CHARS_PER_TOKEN) + 1
 
 
-def max_input_tokens(schema_tokens: int = 0) -> int:
+def max_input_tokens(overhead_tokens: int = 0) -> int:
     """
     Largest input we will put in one request.
 
     Derived from the context window rather than a page count, and net of what
-    the response and the schema will occupy.
+    the response and the per-request overhead will occupy.
     """
-    available = CONTEXT_WINDOW_TOKENS - MAX_OUTPUT_TOKENS - schema_tokens
+    available = CONTEXT_WINDOW_TOKENS - MAX_OUTPUT_TOKENS - overhead_tokens
     return int(available * CONTEXT_SAFETY_MARGIN)
 
 
@@ -130,7 +164,8 @@ def extract_structured(
     output_schema: dict,
     document_text: str | None = None,
     pdf_bytes: bytes | None = None,
-    model_id: str = MODEL_ID,
+    model_id: str | None = None,
+    profile: ModelProfile | None = None,
 ) -> ExtractionResponse:
     """
     One structured-extraction call against a PDF excerpt.
@@ -159,10 +194,14 @@ def extract_structured(
         the document dominates the token count.
 
       * Adaptive thinking at high effort. Locating a burdensome-condition
-        limitation across a 90-page agreement is not a lookup.
+        limitation across a 90-page agreement is not a lookup. Every model
+        offered here accepts the same request shape, so only the model name
+        changes between them.
     """
     if document_text is None and pdf_bytes is None:
         raise ValueError("extract_structured requires either document_text or pdf_bytes")
+
+    profile = profile or profile_for(model_id)
 
     if document_text is not None:
         source_block = {
@@ -182,7 +221,7 @@ def extract_structured(
         }
 
     with client.messages.stream(
-        model=model_id,
+        model=profile.model_id,
         max_tokens=MAX_OUTPUT_TOKENS,
         system=[
             {
@@ -232,7 +271,7 @@ def extract_structured(
     usage = message.usage
     return ExtractionResponse(
         data=data,
-        model_id=model_id,
+        model_id=profile.model_id,
         input_tokens=getattr(usage, "input_tokens", 0) or 0,
         output_tokens=getattr(usage, "output_tokens", 0) or 0,
         cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,

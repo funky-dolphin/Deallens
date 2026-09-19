@@ -43,7 +43,12 @@ from deallens.db import (
     save_ingestion,
     set_review_status,
 )
-from deallens.extraction import MODEL_ID, PROMPT_VERSION, extract_document
+from deallens.extraction import (
+    DEFAULT_MODEL_ID,
+    MODEL_PROFILES,
+    PROMPT_VERSION,
+    extract_document,
+)
 from deallens.ingestion import ingest
 
 load_dotenv()
@@ -160,7 +165,7 @@ with st.sidebar:
         ],
     )
     st.divider()
-    st.caption(f"model `{MODEL_ID}`")
+    st.caption(f"extraction model `{st.session_state.get('model_id', DEFAULT_MODEL_ID)}`")
     st.caption(f"prompt `{PROMPT_VERSION}`")
     if DB_PATH == ":memory:":
         st.caption(
@@ -276,6 +281,15 @@ elif page.startswith("2"):
         ingestion = live[document_id]
         pdf_bytes = st.session_state.pdf_bytes[document_id]
 
+        model_ids = list(MODEL_PROFILES)
+        model_id = st.selectbox(
+            "Extraction model",
+            model_ids,
+            index=model_ids.index(DEFAULT_MODEL_ID),
+            format_func=lambda mid: MODEL_PROFILES[mid].label,
+        )
+        st.session_state.model_id = model_id
+
         if not ingestion.may_extract:
             st.error(
                 f"Extraction is blocked: ingestion status is "
@@ -296,6 +310,7 @@ elif page.startswith("2"):
                         ingestion,
                         pdf_bytes,
                         max_cost_usd=MAX_COST_USD,
+                        model_id=model_id,
                     )
 
                 if run.error:
@@ -305,7 +320,7 @@ elif page.startswith("2"):
                     counts = run.by_status()
                     st.success(
                         f"Extracted {len(run.fields)} fields from {len(run.layers)} layer(s) "
-                        f"· run `{run.run_id}`"
+                        f"· run `{run.run_id}` · model `{run.model_id}`"
                     )
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Found", counts.get("found", 0))
@@ -631,12 +646,20 @@ elif page.startswith("6"):
                         f"EXTRACTED DATA:\n{context}\n\n"
                         f"QUESTION: {final_question}"
                     )
+                    # Q&A always runs on the default model. The extraction
+                    # toggle scopes to extraction on purpose: answering here
+                    # costs a fraction of a run, and holding the answer model
+                    # fixed keeps a cheaper extraction's effect visible in the
+                    # answers rather than confounded with a cheaper answerer.
                     with st.spinner("Querying…"):
                         response = _anthropic_client(api_key).messages.create(
-                            model=MODEL_ID,
+                            model=DEFAULT_MODEL_ID,
                             max_tokens=2048,
                             messages=[{"role": "user", "content": prompt}],
                         )
                     st.markdown("### Answer")
                     st.markdown(response.content[0].text)
-                    st.caption(f"{len(rows)} asserted fields used as context · model `{MODEL_ID}`")
+                    st.caption(
+                        f"{len(rows)} asserted fields used as context · "
+                        f"model `{DEFAULT_MODEL_ID}`"
+                    )

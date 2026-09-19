@@ -31,15 +31,15 @@ from ..ingestion.pipeline import IngestionResult
 from . import models
 from .client import (
     CHARS_PER_TOKEN,
-    INPUT_USD_PER_MTOK,
     MAX_PAGES_PER_PDF_REQUEST,
     MODEL_ID,
-    OUTPUT_USD_PER_MTOK,
     ExtractionResponse,
+    ModelProfile,
     build_text_content,
     estimate_tokens,
     extract_structured,
     max_input_tokens,
+    profile_for,
     slice_pdf,
 )
 from .models import ExtractedField
@@ -76,26 +76,33 @@ class LayerExtraction:
 
 @dataclass
 class LayerEstimate:
-    """Pre-flight size and cost estimate for one layer."""
+    """
+    Pre-flight size and cost estimate for one layer.
+
+    Priced against the model that will actually run it. A cost gate that
+    prices every model at the most expensive one's rates would block runs
+    that are affordable, which is a failure in the other direction.
+    """
 
     layer_id: str
     pages: int
     input_tokens: int
     requests: int
+    profile: ModelProfile = field(default_factory=profile_for)
+
+    def _cost(self, output_tokens_per_request: int) -> float:
+        return (
+            self.input_tokens * self.profile.input_usd_per_mtok
+            + self.requests * output_tokens_per_request * self.profile.output_usd_per_mtok
+        ) / 1_000_000
 
     @property
     def cost_low(self) -> float:
-        return (
-            self.input_tokens * INPUT_USD_PER_MTOK
-            + self.requests * OUTPUT_TOKENS_PER_REQUEST_LOW * OUTPUT_USD_PER_MTOK
-        ) / 1_000_000
+        return self._cost(OUTPUT_TOKENS_PER_REQUEST_LOW)
 
     @property
     def cost_high(self) -> float:
-        return (
-            self.input_tokens * INPUT_USD_PER_MTOK
-            + self.requests * OUTPUT_TOKENS_PER_REQUEST_HIGH * OUTPUT_USD_PER_MTOK
-        ) / 1_000_000
+        return self._cost(OUTPUT_TOKENS_PER_REQUEST_HIGH)
 
 
 @dataclass
@@ -103,6 +110,7 @@ class RunEstimate:
     """What a run is expected to cost, before any of it is spent."""
 
     layers: list[LayerEstimate] = field(default_factory=list)
+    profile: ModelProfile = field(default_factory=profile_for)
 
     @property
     def input_tokens(self) -> int:
@@ -129,7 +137,8 @@ class RunEstimate:
         return (
             "; ".join(parts)
             + f" | total ~{self.input_tokens:,} input tokens across "
-            f"{self.requests} request(s), ${self.cost_low:.2f}-${self.cost_high:.2f}"
+            f"{self.requests} request(s), ${self.cost_low:.2f}-${self.cost_high:.2f} "
+            f"on {self.profile.model_id}"
         )
 
 
@@ -263,6 +272,7 @@ def _record_from_payload(
     ingestion: IngestionResult,
     layer: DocumentLayer,
     page_map: list[int],
+    model_id: str = MODEL_ID,
 ) -> ExtractedField:
     """
     Turn one field's raw model output into an ExtractedField with provenance.
@@ -279,7 +289,7 @@ def _record_from_payload(
         run_id=ingestion.run_id,
         document_layer=layer.qualified_id,
         extraction_method="llm",
-        model_id=MODEL_ID,
+        model_id=model_id,
         prompt_version=PROMPT_VERSION,
     )
 
@@ -396,6 +406,7 @@ def estimate_run(
     ingestion: IngestionResult,
     specs: tuple[FieldSpec, ...] | None = None,
     layer_ids: tuple[str, ...] = EXTRACTABLE_LAYERS,
+    model_id: str | None = None,
 ) -> RunEstimate:
     """
     Size and price a run without making any API call.
@@ -411,11 +422,15 @@ def estimate_run(
 
     The prompt is measured rather than guessed at, because the field catalogue
     inside it is the larger half of the per-request overhead.
+
+    Pricing follows the chosen model, because the estimate feeds the spend
+    ceiling.
     """
     specs = specs if specs is not None else fields_for(ingestion.structure.structure)
     schema_tokens = estimate_tokens(len(json.dumps(build_output_schema(specs))))
+    profile = profile_for(model_id)
 
-    estimate = RunEstimate()
+    estimate = RunEstimate(profile=profile)
     for layer in [l for l in ingestion.layers if l.layer_id in layer_ids]:
         pages = layer.body_pages()
         if not pages:
@@ -441,6 +456,7 @@ def estimate_run(
                 pages=len(pages),
                 input_tokens=content_tokens + len(chunks) * (schema_tokens + prompt_tokens),
                 requests=len(chunks),
+                profile=profile,
             )
         )
     return estimate
@@ -452,8 +468,10 @@ def extract_layer(
     layer: DocumentLayer,
     pdf_bytes: bytes,
     specs: tuple[FieldSpec, ...],
+    profile: ModelProfile | None = None,
 ) -> LayerExtraction:
     """Extract every applicable field from one document layer."""
+    profile = profile or profile_for()
     result = LayerExtraction(layer_id=layer.qualified_id, layer_label=layer.label)
 
     pages = layer.body_pages()
@@ -513,6 +531,7 @@ def extract_layer(
             system_prompt=SYSTEM_PROMPT,
             user_prompt=prompt,
             output_schema=schema,
+            profile=profile,
             **source,
         )
         result.input_tokens += response.input_tokens
@@ -532,7 +551,7 @@ def extract_layer(
                     document_layer=layer.qualified_id,
                     status=models.UNRESOLVED,
                     review_status=models.EXCEPTION,
-                    model_id=MODEL_ID,
+                    model_id=profile.model_id,
                     prompt_version=PROMPT_VERSION,
                 )
                 record.add_note("Model omitted this field from its response.")
@@ -541,7 +560,9 @@ def extract_layer(
 
             readings = [
                 _finalise(
-                    _record_from_payload(spec.name, entry, ingestion, layer, page_map),
+                    _record_from_payload(
+                        spec.name, entry, ingestion, layer, page_map, profile.model_id
+                    ),
                     ingestion,
                 )
                 for entry in entries
@@ -579,6 +600,7 @@ def extract_document(
     pdf_bytes: bytes,
     layer_ids: tuple[str, ...] = EXTRACTABLE_LAYERS,
     max_cost_usd: float | None = None,
+    model_id: str | None = None,
 ) -> ExtractionRun:
     """
     Extract structured fields from every extractable layer of one document.
@@ -590,11 +612,18 @@ def extract_document(
     filing several times larger than expected, or one whose layers were
     mis-segmented so the whole document landed in a single layer, would
     otherwise be discovered only on the invoice.
+
+    `model_id` selects the model. It is recorded on the run and on every field
+    the run produces, because Workstream 8 requires an output be traceable to
+    the model that made it -- and a field extracted by Haiku that claims Opus
+    produced it is worse than one with no attribution at all. An unrecognised
+    id raises rather than falling back.
     """
+    profile = profile_for(model_id)
     run = ExtractionRun(
         document_id=ingestion.document_id,
         run_id=ingestion.run_id,
-        model_id=MODEL_ID,
+        model_id=profile.model_id,
         prompt_version=PROMPT_VERSION,
     )
 
@@ -614,7 +643,7 @@ def extract_document(
         run.error = "No extractable layer was identified in this document."
         return run
 
-    run.estimate = estimate_run(ingestion, specs, layer_ids)
+    run.estimate = estimate_run(ingestion, specs, layer_ids, profile.model_id)
     if max_cost_usd is not None and run.estimate.cost_high > max_cost_usd:
         run.error = (
             f"Extraction halted before any request: estimated cost "
@@ -625,7 +654,9 @@ def extract_document(
 
     for layer in targets:
         try:
-            extraction = extract_layer(client, ingestion, layer, pdf_bytes, specs)
+            extraction = extract_layer(
+                client, ingestion, layer, pdf_bytes, specs, profile
+            )
         except Exception as exc:
             run.warnings.append(f"Layer {layer.qualified_id} failed: {exc}")
             continue
