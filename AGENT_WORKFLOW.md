@@ -94,7 +94,10 @@ P&L formula: `-DV01 × rate_shift_bps`
 
 ## Known Gaps / TODO
 
-- [ ] WS3: Filing summary vs agreement comparison view not yet built
+- [x] WS3: Filing summary vs agreement comparison, on the **Summary vs.
+      agreement** page. Computed on demand from the stored fields, not
+      persisted — the review queue can change a field's status, which would
+      leave a stored comparison stale
 - [ ] WS4: Transaction timeline visualization not yet built
 - [ ] WS7: Hedging assumptions not yet adapted for Organon and Uber deals
 - [ ] Live extraction against the Bio-Techne 8-K not yet run. Ingestion runs

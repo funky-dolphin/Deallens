@@ -14,6 +14,7 @@ into the page.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 
@@ -22,6 +23,12 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from deallens.analytics.hedging import BIO_TECHNE_ASSUMPTIONS, run_scenarios
+from deallens.comparison import (
+    CLASS_ORDER,
+    NOT_APPLICABLE,
+    classification_counts,
+    compare_layers,
+)
 from deallens.db import (
     get_connection,
     get_document,
@@ -102,7 +109,7 @@ with st.sidebar:
         [
             "1 · Ingest & inspect",
             "2 · Extract",
-            "3 · Extracted fields",
+            "3 · Summary vs. agreement",
             "4 · Review queue",
             "5 · Hedging analysis",
             "6 · Q&A",
@@ -268,9 +275,14 @@ elif page.startswith("2"):
                             st.write(f"- {warning}")
 
 
-# ── 3 · Extracted fields ──────────────────────────────────────────────────────
+# ── 3 · Summary vs. agreement ─────────────────────────────────────────────────
 elif page.startswith("3"):
-    st.title("Extracted fields")
+    st.title("Summary vs. agreement")
+    st.caption(
+        "Each field is extracted from the 8-K filing summary and from the operative "
+        "agreement separately, then compared here. Where the two disagree, both "
+        "readings are kept and the field is classified rather than resolved."
+    )
 
     document_id = _doc_picker()
     if document_id:
@@ -278,43 +290,124 @@ elif page.startswith("3"):
         if not rows:
             st.info("Nothing extracted for this document yet. See **Extract**.")
         else:
-            show_empty = st.checkbox(
-                "Show fields that were not found or do not apply", value=False
+            comparisons = compare_layers(rows)
+            counts = classification_counts(comparisons)
+
+            columns = st.columns(max(len(counts), 1))
+            for column, (name, count) in zip(columns, counts.items()):
+                column.metric(name.replace("_", " "), count)
+
+            st.caption(
+                "Source hierarchy: on a conflict the operative agreement governs, "
+                "because it is the executed contract and the filing summary is a "
+                "description of it. The summary's value is preserved either way."
             )
-            grouped: dict[str, list[dict]] = {}
-            for row in rows:
-                grouped.setdefault(row["category"] or "uncategorised", []).append(row)
+
+            default_classes = [
+                name for name in CLASS_ORDER if name in counts and name != NOT_APPLICABLE
+            ]
+            chosen = st.multiselect(
+                "Show classifications",
+                [name for name in CLASS_ORDER if name in counts],
+                default=default_classes,
+                format_func=lambda name: name.replace("_", " "),
+            )
+
+            visible = [c for c in comparisons if c.classification in chosen]
+            if not visible:
+                st.info("No fields in the selected classifications.")
+
+            grouped: dict[str, list] = {}
+            for comparison in visible:
+                grouped.setdefault(comparison.category or "uncategorised", []).append(comparison)
 
             for category, items in grouped.items():
-                visible = [
-                    r
-                    for r in items
-                    if show_empty or r["status"] in {"found", "conflict", "unresolved"}
-                ]
-                if not visible:
-                    continue
-                with st.expander(f"**{category}** ({len(visible)})", expanded=True):
+                with st.expander(f"**{category}** ({len(items)})", expanded=True):
                     st.dataframe(
                         pd.DataFrame(
                             [
                                 {
-                                    "field": r["field_name"],
-                                    "value": r["normalized_value"],
-                                    "ccy": r["currency"],
-                                    "status": r["status"],
-                                    "conf": r["confidence"],
-                                    "layer": r["document_layer"],
-                                    "page": r["printed_page"] or r["pdf_page"],
-                                    "evidence ✓": r["evidence_verified"],
-                                    "review": r["review_status"],
-                                    "evidence": r["evidence"],
+                                    "field": c.field_name,
+                                    "!": "⚠️" if c.is_critical else "",
+                                    "classification": c.classification.replace("_", " "),
+                                    "filing summary": c.summary.normalized_value,
+                                    "p.": c.summary.page,
+                                    "agreement": c.agreement.normalized_value,
+                                    "p. ": c.agreement.page,
+                                    "governing value": c.preferred_value,
                                 }
-                                for r in visible
+                                for c in items
                             ]
                         ),
                         width="stretch",
                         hide_index=True,
                     )
+
+            # Both readings in full, for the fields where the difference matters.
+            needs_attention = [c for c in visible if c.needs_review]
+            if needs_attention:
+                st.subheader(f"Conflicts and unresolved fields ({len(needs_attention)})")
+                for comparison in needs_attention:
+                    label = "⚠️ " if comparison.is_critical else ""
+                    with st.expander(
+                        f"{label}`{comparison.field_name}` — "
+                        f"{comparison.classification.replace('_', ' ')}"
+                    ):
+                        st.write(comparison.reason)
+                        for title, reading in (
+                            ("Filing summary", comparison.summary),
+                            ("Operative agreement", comparison.agreement),
+                        ):
+                            st.markdown(f"**{title}**")
+                            if reading.raw_value or reading.evidence:
+                                st.markdown(
+                                    f"- value: `{reading.normalized_value}` "
+                                    f"(raw: {reading.raw_value!r})\n"
+                                    f"- page {reading.page} · {reading.section or 'no section'}\n"
+                                    f"- status: `{reading.status}` · "
+                                    f"confidence {reading.confidence:.0%}"
+                                )
+                                if reading.evidence:
+                                    st.caption(f"“{reading.evidence}”")
+                                if reading.locator_uri:
+                                    st.code(reading.locator_uri, language=None)
+                            else:
+                                st.caption("Nothing was read from this layer.")
+
+            with st.expander("Extracted field rows, per layer (audit record)"):
+                st.caption(
+                    f"{len(rows)} rows — one per field per layer, which is what the "
+                    "comparison above is computed from."
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "field": r["field_name"],
+                                "layer": r["document_layer"],
+                                "value": r["normalized_value"],
+                                "ccy": r["currency"],
+                                "status": r["status"],
+                                "conf": r["confidence"],
+                                "page": r["printed_page"] or r["pdf_page"],
+                                "evidence ✓": r["evidence_verified"],
+                                "review": r["review_status"],
+                                "run": r["run_id"],
+                                "evidence": r["evidence"],
+                            }
+                            for r in rows
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            st.download_button(
+                "Download comparison (JSON)",
+                data=json.dumps([c.to_dict() for c in comparisons], indent=2, default=str),
+                file_name=f"{document_id}_summary_vs_agreement.json",
+                mime="application/json",
+            )
 
 
 # ── 4 · Review queue ──────────────────────────────────────────────────────────

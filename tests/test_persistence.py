@@ -89,6 +89,55 @@ def test_reingestion_replaces_rather_than_duplicates(conn, bio_techne_ingested):
     assert pages == 99
 
 
+def test_reingestion_survives_an_existing_extraction():
+    """
+    Re-uploading a document that has already been extracted must not fail.
+
+    `extracted_fields` holds a foreign key to `documents`, and ingestion does
+    not regenerate extractions, so the document row is updated in place rather
+    than deleted and re-inserted. Deleting it raised `FOREIGN KEY constraint
+    failed` -- and because document_id is derived from the file checksum,
+    re-uploading the same PDF hit that every time.
+
+    The extraction must also survive: the file is byte-identical, so its
+    layers and page numbering are unchanged and the stored fields still refer
+    to something real.
+    """
+    from deallens.db import get_extracted_fields, save_extraction
+    from deallens.extraction import extract_document
+    from deallens.ingestion import ingest
+
+    from .pdf_factory import agreement_pages, exhibit_cover, make_pdf, sec_cover_page
+    from .test_extraction import FakeClient
+
+    pdf = make_pdf(
+        [
+            sec_cover_page(),
+            "Item 1.01 Entry into a Material Definitive Agreement.",
+            exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER"),
+        ]
+        + agreement_pages(body_pages=3)
+    )
+
+    connection = initialize_schema(get_connection())
+    try:
+        first = ingest(pdf, "filing.pdf", run_id="run-one")
+        document_id = save_ingestion(connection, first)
+        save_extraction(connection, extract_document(FakeClient(), first, pdf))
+        extracted = len(get_extracted_fields(connection, document_id))
+        assert extracted > 0
+
+        # The user uploads the same file again.
+        second = ingest(pdf, "filing.pdf", run_id="run-two")
+        assert second.document_id == document_id, "same bytes, same document"
+        save_ingestion(connection, second)
+
+        assert get_document(connection, document_id)["run_id"] == "run-two"
+        assert len(get_extracted_fields(connection, document_id)) == extracted
+    finally:
+        connection.close()
+
+
 @requires_bio_techne
 def test_duplicate_detected_by_checksum_not_filename(conn, bio_techne_ingested):
     save_ingestion(conn, bio_techne_ingested)

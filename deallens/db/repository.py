@@ -52,6 +52,14 @@ def save_ingestion(
     Re-ingesting the same document replaces its prior records rather than
     accumulating them, so the database always reflects the most recent run for
     a given file while the `runs` table preserves the history of runs.
+
+    The per-page and per-layer tables are cleared and rewritten, because
+    ingestion regenerates all of them. The `documents` row is updated in place
+    rather than deleted and re-inserted: `extracted_fields` holds a foreign
+    key to it, and ingestion does not regenerate extractions. Deleting it
+    raised `FOREIGN KEY constraint failed` on any re-ingest of a document that
+    had already been extracted -- which, since the document_id is derived from
+    the file checksum, meant re-uploading the same PDF always failed.
     """
     document_id = result.document_id
     try:
@@ -66,7 +74,6 @@ def save_ingestion(
                 "structure_evidence",
             ):
                 conn.execute(f"DELETE FROM {table} WHERE document_id = ?", (document_id,))
-            conn.execute("DELETE FROM documents WHERE document_id = ?", (document_id,))
 
             record = result.document_record()
             conn.execute(
@@ -78,6 +85,23 @@ def save_ingestion(
                     transaction_structure, structure_confidence,
                     structure_review_status, ingestion_version, schema_version, run_id
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                    filename = excluded.filename,
+                    source_url = excluded.source_url,
+                    checksum = excluded.checksum,
+                    byte_size = excluded.byte_size,
+                    filing_date = excluded.filing_date,
+                    ingestion_timestamp = excluded.ingestion_timestamp,
+                    page_count = excluded.page_count,
+                    is_machine_readable = excluded.is_machine_readable,
+                    requires_ocr = excluded.requires_ocr,
+                    ingestion_status = excluded.ingestion_status,
+                    transaction_structure = excluded.transaction_structure,
+                    structure_confidence = excluded.structure_confidence,
+                    structure_review_status = excluded.structure_review_status,
+                    ingestion_version = excluded.ingestion_version,
+                    schema_version = excluded.schema_version,
+                    run_id = excluded.run_id
                 """,
                 (
                     record["document_id"],

@@ -31,11 +31,24 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 - Spend is estimated and gated before the first request
 - Model: claude-opus-5
 
-### WS3 — Field Comparison (Partial)
-- Compare 8-K filing summary vs full merger agreement
-- Flag conflicts, matches, summary-only fields
-- Schema in place (`field_comparisons` table)
-- **TODO**: Build UI view and comparison logic
+### WS3 — Field Comparison ✅
+- Each field's filing-summary and agreement readings are compared and
+  classified into the assignment's seven classes: match, normalized match,
+  summary only, agreement only, conflict, not applicable, unresolved
+- `match` and `normalized match` are told apart on the source text, not the
+  normalized value: "$250 million" and "$250,000,000" both normalize to the
+  same float, and reporting them as a plain match would hide that the two
+  documents state the term differently
+- Both values and both source locations are preserved on every comparison,
+  including conflicts
+- Source hierarchy: the operative agreement governs, because it is the
+  executed contract and the filing summary is a description of it. The
+  nomination is recorded; the other reading is never discarded
+- Computed on demand rather than stored — the review queue can change a
+  field's status, and a persisted comparison would be stale immediately.
+  There is no `field_comparisons` table, and an earlier claim here that the
+  schema was in place was wrong
+- Surfaced on the **Summary vs. agreement** page, with a JSON export
 
 ### WS4 — Transaction Timeline
 - Outside date, expected closing, extension conditions
@@ -114,16 +127,17 @@ deallens/
     normalize.py            money/date/percent normalization
     models.py               ExtractedField + the fail-closed rules
     extractor.py            estimate_run(), extract_layer(), extract_document()
+  comparison.py             WS3 summary vs. agreement classification
   analytics/hedging.py      WS5 DV01 and scenario matrix
   db/                       schema + repository (the audit record)
 scripts/estimate_cost.py    price a run from the CLI, offline
-tests/                      91 tests
+tests/                      118 tests
 ```
 
 ## Key Decisions
 
 - **SQLite in-memory over ChromaDB/Pinecone**: Simpler, no persistence issues on Streamlit Cloud, sufficient for structured field Q&A
-- **Text over page images where the filing allows it**: the original design sent the whole PDF as base64. Sending extracted text for machine-readable filings, and reserving page images for pages that genuinely need them, cut extraction input from 290,717 to 133,128 tokens for the same document
+- **Text over page images where the filing allows it**: the original design sent the whole PDF as base64. Sending extracted text for machine-readable filings, and reserving page images for pages that genuinely need them, cut extraction input from 290,717 to 133,128 tokens for the same document (127,356 since prompt 3.0.0 moved the field descriptions out of the schema)
 - **Per-session DB in st.session_state**: Isolates users, no cross-contamination
 - **Synthetic assumptions clearly labeled**: All hedging inputs flagged as synthetic unless extracted from document
 
