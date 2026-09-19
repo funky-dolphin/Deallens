@@ -7,7 +7,7 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 
 ## Workstreams
 
-### WS1 — Document Ingestion ✅
+### WS1 — Document Ingestion — complete
 - File uploader in Streamlit (PDF only), optional source URL
 - SHA-256 checksum for deduplication
 - Page inventory with per-page text, character counts and image detection
@@ -17,7 +17,7 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
   printed-label reconciliation. Unreadable pages block extraction outright
 - Per-session in-memory SQLite database
 
-### WS2 — LLM Extraction ✅
+### WS2 — LLM Extraction — complete
 - Machine-readable filings extracted as text; only image-only pages fall back
   to page images, which is what cut input cost 54%
 - Each layer queried separately so the summary and the agreement can be
@@ -31,7 +31,7 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 - Spend is estimated and gated before the first request
 - Model: claude-opus-5
 
-### WS3 — Field Comparison ✅
+### WS3 — Field Comparison — complete
 - Each field's filing-summary and agreement readings are compared and
   classified into the assignment's seven classes: match, normalized match,
   summary only, agreement only, conflict, not applicable, unresolved
@@ -55,7 +55,7 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 - Risk event map
 - **TODO**: Build timeline visualization in Streamlit
 
-### WS5 — Hedging Analytics ✅
+### WS5 — Hedging Analytics — complete
 - DV01 calculation for $4B notional, 7-year tenor
 - Rate shift scenarios: ±25bps, +50bps
 - Parallel rate + credit spread scenario
@@ -63,7 +63,7 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 - Three strategies: Unhedged, Forward-Starting IRS, Deal-Contingent
 - All inputs labeled as synthetic assumptions
 
-### WS6 — Document Q&A ✅
+### WS6 — Document Q&A — complete
 - 12 preset questions from assignment
 - Custom question input
 - Claude answers grounded in extracted SQLite fields

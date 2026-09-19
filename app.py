@@ -62,6 +62,7 @@ from deallens.extraction import (
 )
 from deallens.ingestion import ingest
 from deallens.qa import PRESET_QUESTIONS, answer_question
+from deallens.review import apply_correction
 from deallens.timeline import build_timeline
 
 load_dotenv()
@@ -72,7 +73,79 @@ load_dotenv()
 # above this. It is not shown in the UI; set it to None to remove the gate.
 MAX_COST_USD = 25.0
 
-st.set_page_config(page_title="DealLens", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="DealLens", layout="wide")
+
+# House palette. Navy carries the interface; red is reserved for figures and
+# statuses a reviewer has to act on, so that it still means something when it
+# appears.
+NAVY = "#1A3668"
+RED = "#C8102E"
+INK = "#10192B"
+MUTED = "#5B6577"
+RULE = "#D8DEE8"
+
+st.markdown(
+    f"""
+    <style>
+      /* Tabular figures, so money and dates line up column to column. */
+      [data-testid="stDataFrame"] {{ font-variant-numeric: tabular-nums; }}
+
+      /* Masthead rule: a short red lead-in, then navy across the page. This
+         is the brand mark, and the one decorative use of red -- everywhere
+         else it has to be carrying a meaning. */
+      h1 {{
+        font-size: 1.45rem; font-weight: 650; color: {INK};
+        letter-spacing: -0.01em;
+        padding-bottom: 0.45rem; margin-bottom: 0.7rem;
+        background-image: linear-gradient(90deg, {RED} 0 3.25rem, {NAVY} 3.25rem);
+        background-size: 100% 2px;
+        background-position: 0 100%;
+        background-repeat: no-repeat;
+      }}
+      h2 {{
+        font-size: 1.05rem; font-weight: 650; color: {NAVY};
+        margin-top: 1.4rem; padding-left: 0.55rem;
+        border-left: 3px solid {RED};
+      }}
+      h3 {{ font-size: 0.92rem; font-weight: 650; color: {INK}; }}
+
+      /* Alerts as ruled notices rather than rounded pastel cards. The icon
+         is dropped: the words carry the message. */
+      [data-testid="stAlert"] {{
+        border-radius: 0; border-left: 3px solid {NAVY};
+        background: {'#F4F6F9'}; color: {INK}; padding: 0.6rem 0.9rem;
+      }}
+      [data-testid="stAlert"] svg {{ display: none; }}
+      [data-testid="stAlertContentError"],
+      [data-testid="stAlertContentWarning"] {{ color: {INK}; }}
+      div[data-testid="stAlert"]:has([data-testid="stAlertContentError"]),
+      div[data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]) {{
+        border-left-color: {RED};
+      }}
+
+      section[data-testid="stSidebar"] {{
+        border-right: 1px solid {RULE};
+        border-top: 3px solid {RED};
+      }}
+      section[data-testid="stSidebar"] h1 {{
+        font-size: 1.05rem; letter-spacing: 0.06em; text-transform: uppercase;
+        color: {NAVY};
+        background-image: linear-gradient(90deg, {RED} 0 1.6rem, {NAVY} 1.6rem);
+        background-size: 100% 2px;
+        background-position: 0 100%;
+        background-repeat: no-repeat;
+        padding-bottom: 0.4rem;
+      }}
+
+      /* The one status word a reviewer must not miss. */
+      .deallens-flag {{ color: {RED}; font-weight: 650; }}
+
+      .stButton button {{ border-radius: 2px; font-weight: 600; }}
+      hr {{ border-color: {RULE}; }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
@@ -147,21 +220,42 @@ def _layer_cell(reading) -> object | None:
     return None
 
 
-def _stat(column, label: str, value: str) -> None:
+def _stat(column, label: str, value: str, alert: bool = False) -> None:
     """
     One summary figure, smaller than `st.metric` renders them.
 
     `st.metric` sets its value at roughly 2.25rem, which for five figures
     across a row reads as a dashboard headline rather than a document
-    summary. Values are escaped because this is the one place the app emits
-    raw HTML.
+    summary. `alert` turns the value red, and is for a state a reviewer has
+    to act on -- not for emphasis. Values are escaped because this is the one
+    place the app emits raw HTML.
     """
+    colour = RED if alert else INK
     column.markdown(
         f"<div style='font-size:0.72rem;text-transform:uppercase;letter-spacing:0.04em;"
-        f"color:#808495'>{html.escape(label)}</div>"
-        f"<div style='font-size:1.05rem;font-weight:600;line-height:1.5'>"
-        f"{html.escape(value)}</div>",
+        f"color:{MUTED}'>{html.escape(label)}</div>"
+        f"<div style='font-size:1.05rem;font-weight:600;line-height:1.5;"
+        f"color:{colour}'>{html.escape(value)}</div>",
         unsafe_allow_html=True,
+    )
+
+
+def _red_if_negative(value) -> str:
+    """
+    Red for a loss, and for nothing else.
+
+    The palette keeps red out of headers, rules and chrome so that when it
+    does appear in a figure it carries information rather than decoration.
+    """
+    return f"color: {RED}" if isinstance(value, (int, float)) and value < 0 else ""
+
+
+def _red_if_conflict(value) -> str:
+    """Red on the classifications that need a human, and on no others."""
+    return (
+        f"color: {RED}; font-weight: 600"
+        if isinstance(value, str) and value in {"conflict", "unresolved"}
+        else ""
     )
 
 
@@ -180,7 +274,7 @@ api_key = _api_key()
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("🔍 DealLens")
+    st.title("DealLens")
     st.caption("AI-assisted transaction & hedging intelligence")
     st.divider()
 
@@ -237,9 +331,14 @@ if page.startswith("1"):
     if document_id:
         doc = get_document(conn, document_id)
         status = doc["ingestion_status"]
-        badge = {"ingested": "✅", "ingested_with_warnings": "⚠️", "review_required": "⚠️"}.get(
-            status, "⛔"
-        )
+        # Status reads as words. A green tick and a red cross say less than
+        # the status name already does, and a reviewer signing off on an
+        # extraction should be reading, not decoding.
+        badge = {
+            "ingested": "OK",
+            "ingested_with_warnings": "CHECK",
+            "review_required": "CHECK",
+        }.get(status, "BLOCKED")
 
         # Machine-readability decides whether extraction sends text or page
         # images, which is the largest cost lever in the pipeline, so it
@@ -248,12 +347,12 @@ if page.startswith("1"):
         stats = [
             ("Pages", str(doc["page_count"])),
             ("Machine readable", "Yes" if machine_readable else "No — needs OCR"),
-            ("Status", f"{badge} {status}"),
+            ("Status", f"{badge} · {status}"),
             ("Structure", doc["transaction_structure"]),
             ("Structure confidence", f"{doc['structure_confidence']:.0%}"),
         ]
         for column, (label, value) in zip(st.columns(len(stats)), stats):
-            _stat(column, label, value)
+            _stat(column, label, value, alert=label == "Status" and badge != "OK")
 
         if status == "blocked":
             st.error(
@@ -467,7 +566,7 @@ elif page.startswith("3"):
                                 }
                                 for c in items
                             ]
-                        ),
+                        ).style.map(_red_if_conflict, subset=["classification"]),
                         width="stretch",
                         hide_index=True,
                     )
@@ -517,7 +616,7 @@ elif page.startswith("3"):
                                 "status": r["status"],
                                 "conf": r["confidence"],
                                 "page": r["printed_page"] or r["pdf_page"],
-                                "evidence ✓": r["evidence_verified"],
+                                "evidence ok": r["evidence_verified"],
                                 "review": r["review_status"],
                                 "run": r["run_id"],
                                 "evidence": r["evidence"],
@@ -677,8 +776,15 @@ elif page.startswith("5"):
         if not queue:
             st.success("Nothing awaiting review for this document.")
         for row in queue:
-            mark = "🔴" if row["is_critical"] else "🟡"
+            mark = "CRITICAL" if row["is_critical"] else "standard"
             with st.expander(f"{mark} **{row['field_name']}** — {row['status']}"):
+                if row["is_critical"]:
+                    st.markdown(
+                        "<span class='deallens-flag'>CRITICAL FIELD</span> — "
+                        "held to a higher confidence bar; a wrong value here is "
+                        "materially worse than an honest absence.",
+                        unsafe_allow_html=True,
+                    )
                 st.write(f"**Raw value:** {row['raw_value'] or '—'}")
                 st.write(f"**Normalized:** {row['normalized_value'] or '—'}")
                 st.write(
@@ -694,12 +800,68 @@ elif page.startswith("5"):
                 for note in row["notes"]:
                     st.caption(f"· {note}")
 
-                note = st.text_input("Reviewer note", key=f"note-{row['id']}")
-                c1, c2 = st.columns(2)
-                if c1.button("Mark verified", key=f"ok-{row['id']}"):
+                st.divider()
+                st.markdown("**Correct this field**")
+                st.caption(
+                    "Supplying a value here normalizes it with the same code "
+                    "used for a model reading, records the supersede in the "
+                    "audit notes, and releases the field to Q&A, the timeline "
+                    "and the hedging horizon. Leave blank to annotate only."
+                )
+
+                with st.form(key=f"correct-{row['id']}"):
+                    new_value = st.text_input(
+                        "Value, as the document writes it",
+                        value=row["raw_value"] or "",
+                        placeholder="e.g. $250,000,000",
+                    )
+                    f1, f2 = st.columns([3, 1])
+                    new_evidence = f1.text_input(
+                        "Evidence quote", value=row["evidence"] or ""
+                    )
+                    new_page = f2.number_input(
+                        "PDF page",
+                        min_value=0,
+                        value=int(row["pdf_page"] or 0),
+                        step=1,
+                    )
+                    note = st.text_input("Reviewer note")
+
+                    b1, b2, b3 = st.columns(3)
+                    apply_clicked = b1.form_submit_button(
+                        "Apply correction", type="primary"
+                    )
+                    verified_clicked = b2.form_submit_button("Mark verified")
+                    exception_clicked = b3.form_submit_button("Keep as exception")
+
+                if apply_clicked:
+                    outcome = apply_correction(
+                        conn,
+                        row["id"],
+                        new_value,
+                        evidence=new_evidence or None,
+                        pdf_page=int(new_page) or None,
+                        reviewer_note=note or None,
+                    )
+                    if outcome.accepted:
+                        st.success(
+                            f"`{outcome.field_name}` set to "
+                            f"`{outcome.normalized_value}` "
+                            f"(method `{outcome.extraction_method}`)."
+                        )
+                        if outcome.evidence_verified is False:
+                            st.warning(
+                                "The quote was not found on the cited page. The "
+                                "correction stands on your authority and the "
+                                "mismatch is recorded in the notes."
+                            )
+                        st.rerun()
+                    else:
+                        st.error(outcome.reason)
+                elif verified_clicked:
                     set_review_status(conn, row["id"], "verified", note or None)
                     st.rerun()
-                if c2.button("Keep as exception", key=f"ex-{row['id']}"):
+                elif exception_clicked:
                     set_review_status(conn, row["id"], "exception", note or None)
                     st.rerun()
 
@@ -801,7 +963,9 @@ elif page.startswith("6"):
                 ]
             )
             st.dataframe(
-                table.style.format(money), width="stretch", hide_index=True
+                table.style.format(money).map(_red_if_negative),
+                width="stretch",
+                hide_index=True,
             )
             for note in dict.fromkeys(n for r in rows_for for n in r.notes):
                 st.caption(f"· {note}")

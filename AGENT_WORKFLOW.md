@@ -98,7 +98,20 @@ P&L formula: `-DV01 × rate_shift_bps`
       agreement** page. Computed on demand from the stored fields, not
       persisted — the review queue can change a field's status, which would
       leave a stored comparison stale
-- [ ] WS4: Transaction timeline visualization not yet built
+- [x] WS4: Timeline and risk map, on the **Timeline & risk map** page. Dates
+      the agreement fixes, dates derived from its extension clause (labelled
+      `calculated`, with the arithmetic shown), and dates it only describes,
+      kept apart. The hedge horizon it produces is what WS5 dates its delay
+      scenarios from
+- [ ] **Q&A costs one API call per question, and nothing is cached.** Every
+      press of **Ask** is a fresh request, including the twelve presets; the
+      same question asked twice bills twice. The only free path is a document
+      with no asserted fields, which returns the unsupported-answer sentence
+      without calling the API. This matters on a public deployment, where
+      every visitor's questions bill to the owner's key. Caching by
+      `(document_id, question)` would make repeat asks free and is roughly ten
+      lines — not done, and worth stating in the productionization roadmap
+      rather than quietly fixing
 - [ ] WS7: Hedging assumptions not yet adapted for Organon and Uber deals
 - [ ] Live extraction against the Bio-Techne 8-K not yet run. Ingestion runs
       end to end on it (99 pages, 3 layers, `merger` at 1.00 confidence) and

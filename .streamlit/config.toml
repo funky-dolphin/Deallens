@@ -1,0 +1,22 @@
+# Institutional theme: navy, red, white.
+#
+# Blue is the working colour and carries the interface -- headers, controls,
+# selected state. Red is reserved for one thing only: a figure or a status a
+# reviewer has to act on. A palette where red means "important" everywhere is
+# a palette where red means nothing.
+#
+# Only the theme keys Streamlit defines belong here. Anything finer lives in
+# the stylesheet at the top of app.py.
+
+[theme]
+base = "light"
+primaryColor = "#1A3668"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F6F9"
+textColor = "#10192B"
+font = "sans serif"
+
+[server]
+# Filings are large; the default 200MB cap is more than enough but the
+# smaller ceiling makes an accidental upload fail fast.
+maxUploadSize = 50
