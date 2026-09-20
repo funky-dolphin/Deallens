@@ -330,12 +330,14 @@ def save_extraction(conn: sqlite3.Connection, run) -> int:
                     """
                     INSERT INTO extraction_runs (
                         document_id, layer_id, chunk_count, input_tokens,
-                        output_tokens, cache_read_tokens, model_id, prompt_version, run_id
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                        output_tokens, cache_read_tokens, cache_creation_tokens,
+                        model_id, prompt_version, run_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         run.document_id, layer.layer_id, layer.chunk_count,
                         layer.input_tokens, layer.output_tokens, layer.cache_read_tokens,
+                        layer.cache_creation_tokens,
                         run.model_id, run.prompt_version, run.run_id,
                     ),
                 )

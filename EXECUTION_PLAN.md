@@ -413,6 +413,50 @@ reading is kept in `notes`.
 
 ---
 
+## Testing strategy
+
+**233 tests, no network, no API key, no spend.** The model is replaced by a
+fake that returns whatever payload a test specifies, and documents are built
+by a synthetic PDF factory. The suite runs in about 40 seconds, which is the
+point: a slow suite is a suite that stops being run. Captured output is in
+`TEST_RESULTS.txt`.
+
+| File | Tests | What it holds down |
+|---|---:|---|
+| `test_extraction.py` | 41 | Page mapping back to the source PDF, the four fail-closed controls, the output schema's shape, model selection and provenance, token-budget chunking, incomplete-source handling |
+| `test_ingestion.py` | 39 | Page inventory, text-layer classification, duplicate and unreadable page detection, printed-label reconciliation, layer segmentation, locators |
+| `test_comparison.py` | 32 | The seven WS3 classes, narrative vs typed comparison, the source hierarchy, that a conflicting value is never discarded |
+| `test_hedging.py` | 28 | The required scenario × strategy grid, sign convention, what each hedge does *not* cover, FX from extracted currencies, probability weighting |
+| `test_qa.py` | 25 | Answering only from asserted fields, the unsupported-answer sentence, refusal and truncation handling, prompt-injection fencing |
+| `test_timeline.py` | 21 | The six date kinds, calculated dates and their derivations, refusing to place undatable entries, the hedge horizon |
+| `test_review.py` | 18 | Manual correction and disclosure, normalization of reviewer input, conflicts reaching the queue |
+| `test_generalization.py` | 17 | Document shapes and transaction structures beyond the development filing, financing-exhibit recognition |
+| `test_persistence.py` | 12 | Database round-trip, re-ingestion, the audit record |
+
+Three principles shape what is tested:
+
+**Tests assert behaviour that would be wrong, not behaviour that exists.**
+Most test names are claims — `test_a_value_that_will_not_normalize_is_refused_not_stored`,
+`test_no_rate_hedge_covers_the_issuers_own_credit_spread`. Several were
+written from real output after a defect appeared, and carry the case verbatim.
+
+**The controls are tested from the failing side.** It is easy to prove a
+clean extraction works. The tests that matter prove that a quote absent from
+its page withholds the value, that an unparseable reviewer entry is refused
+rather than stored, and that a question with no evidence returns the required
+sentence without calling the API.
+
+**Characterisation figures are re-measured, not assumed.** The offline cost
+estimate is checked against the API's own `count_tokens` for the development
+filing, with the measured figure stated in the test and flagged as a property
+of the current prompt version rather than a constant.
+
+Not covered: the Streamlit layer has no tests — it is exercised by hand — and
+no test makes a live API call, so request-shape regressions surface only on a
+real run.
+
+---
+
 ## Risks
 
 | Risk | Mitigation |

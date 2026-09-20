@@ -98,6 +98,10 @@ class LayerExtraction:
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read_tokens: int = 0
+    # Written to cache on the first request of a run. The document block is
+    # cached, so on a cold run this carries almost the entire input -- and
+    # omitting it made a 92-page agreement look like 2,137 tokens.
+    cache_creation_tokens: int = 0
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -198,6 +202,19 @@ class ExtractionRun:
     @property
     def total_cache_read_tokens(self) -> int:
         return sum(l.cache_read_tokens for l in self.layers)
+
+    @property
+    def total_cache_creation_tokens(self) -> int:
+        return sum(l.cache_creation_tokens for l in self.layers)
+
+    @property
+    def total_billed_input_tokens(self) -> int:
+        """Every input token the run paid for, however it was billed."""
+        return (
+            self.total_input_tokens
+            + self.total_cache_creation_tokens
+            + self.total_cache_read_tokens
+        )
 
     def by_status(self) -> dict[str, int]:
         counts: dict[str, int] = {}
@@ -568,6 +585,7 @@ def extract_layer(
         result.input_tokens += response.input_tokens
         result.output_tokens += response.output_tokens
         result.cache_read_tokens += response.cache_read_tokens
+        result.cache_creation_tokens += response.cache_creation_tokens
         result.warnings.extend(response.warnings)
 
         payloads = _payloads_by_field(response.data, specs, result.warnings)

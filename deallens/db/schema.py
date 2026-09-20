@@ -166,6 +166,7 @@ _STATEMENTS = (
         input_tokens    INTEGER,
         output_tokens   INTEGER,
         cache_read_tokens INTEGER,
+        cache_creation_tokens INTEGER,
         model_id        TEXT,
         prompt_version  TEXT,
         run_id          TEXT NOT NULL,
@@ -208,6 +209,12 @@ _MIGRATIONS = (
     "WHERE ingestion_status = 'blocked'",
 )
 
+# Columns added after rows already existed. SQLite has no "ADD COLUMN IF NOT
+# EXISTS", so each is attempted and its duplicate-column error ignored.
+_ADDED_COLUMNS = (
+    ("extraction_runs", "cache_creation_tokens", "INTEGER"),
+)
+
 
 def initialize_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
     """
@@ -219,6 +226,11 @@ def initialize_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
     cursor = conn.cursor()
     for statement in _STATEMENTS:
         cursor.execute(statement)
+    for table, column, decl in _ADDED_COLUMNS:
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError:
+            pass  # already present
     for statement in _MIGRATIONS:
         cursor.execute(statement)
     conn.commit()
