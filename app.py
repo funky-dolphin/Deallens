@@ -17,6 +17,8 @@ from __future__ import annotations
 import html
 import json
 import os
+import shutil
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -178,24 +180,46 @@ st.markdown(
 
 
 # ── Session state ─────────────────────────────────────────────────────────────
-# By default the database is in-memory and per browser session, so concurrent
-# users on a deployment cannot see one another's documents.
+# Three storage modes, in order of precedence.
 #
-# Set DEALLENS_DB to a path to keep it on disk instead. That is a development
-# convenience with a real cost, so it is opt-in rather than the default: a
-# refresh starts a new Streamlit session and discards session state, which
-# discards an in-memory database along with the extraction it holds -- and
-# re-running that extraction is the one step in this pipeline that spends
-# money. On a file-backed database, everything downstream of extraction stays
-# browsable across refreshes. Do not set it on a shared deployment, where one
-# file would be one database shared by every visitor.
-DB_PATH = os.getenv("DEALLENS_DB") or ":memory:"
+#   DEALLENS_DB set     Use that file directly. Development convenience: the
+#                       database survives a refresh, so re-reading a filing is
+#                       not needed. Never set it on a shared deployment --
+#                       every visitor would write to one file and see each
+#                       other's documents and corrections.
+#
+#   A seed exists       Copy it to a private file for this session. The seed
+#                       carries the three case filings already ingested and
+#                       extracted, so a reviewer sees results immediately
+#                       rather than being asked to spend money first -- and
+#                       can upload, extract and correct without touching
+#                       anyone else's copy. This is the hosted behaviour.
+#
+#   Neither             In-memory, per session. The original default, kept for
+#                       a clean checkout with no seed.
+SEED_DB = Path(__file__).resolve().parent / "deallens_seed.db"
 
-# The connection is keyed on the path, not merely created once. Setting
-# DEALLENS_DB while the app is already running changes DB_PATH on the next
-# rerun but leaves an existing session holding its original connection, so
-# writes would keep going to the in-memory database this setting was meant to
-# replace -- while the sidebar, reading DB_PATH directly, reported the file.
+
+def _open_storage() -> tuple[str, str]:
+    """Return (path, mode) for this session's database."""
+    configured = os.getenv("DEALLENS_DB")
+    if configured:
+        return configured, "file"
+    if SEED_DB.exists():
+        # A private copy per session. Cheap -- a couple of megabytes -- and it
+        # is what lets the seed be read-only in effect without being read-only
+        # on disk.
+        handle, path = tempfile.mkstemp(prefix="deallens-", suffix=".db")
+        os.close(handle)
+        shutil.copyfile(SEED_DB, path)
+        return path, "seeded"
+    return ":memory:", "memory"
+
+
+# The connection is keyed on the mode, not merely created once. Setting
+# DEALLENS_DB while the app is already running changes what should be used but
+# leaves an existing session holding its original connection, so writes would
+# keep going to the old database while the sidebar reported the new one.
 # Storage that silently disagrees with what the UI claims is worse than no
 # setting at all.
 #
@@ -205,15 +229,20 @@ DB_PATH = os.getenv("DEALLENS_DB") or ":memory:"
 # dropped when the database changes underneath them, because they describe
 # documents the new database may know nothing about. Re-ingesting is local
 # and free.
-if st.session_state.get("db_path") != DB_PATH:
+if st.session_state.get("db_source") != os.getenv("DEALLENS_DB", ""):
     previous = st.session_state.get("db")
     if previous is not None:
         previous.close()
-    st.session_state.db = initialize_schema(get_connection(DB_PATH))
-    st.session_state.db_path = DB_PATH
+    path, mode = _open_storage()
+    st.session_state.db = initialize_schema(get_connection(path))
+    st.session_state.db_path = path
+    st.session_state.db_mode = mode
+    st.session_state.db_source = os.getenv("DEALLENS_DB", "")
     st.session_state.ingestions = {}
     st.session_state.pdf_bytes = {}
 
+DB_PATH = st.session_state.db_path
+DB_MODE = st.session_state.db_mode
 conn = st.session_state.db
 
 
@@ -368,13 +397,18 @@ with st.sidebar:
     st.divider()
     st.caption(f"extraction model `{st.session_state.get('model_id', DEFAULT_MODEL_ID)}`")
     st.caption(f"prompt `{PROMPT_VERSION}`")
-    if DB_PATH == ":memory:":
+    if DB_MODE == "seeded":
+        st.caption(
+            "storage `session copy` — started from the shipped sample data. "
+            "Yours alone; a refresh starts a fresh copy."
+        )
+    elif DB_MODE == "file":
+        st.caption(f"storage `{DB_PATH}` — survives a refresh")
+    else:
         st.caption(
             "storage `in-memory` — a page refresh discards extracted fields. "
             "Set `DEALLENS_DB` to keep them."
         )
-    else:
-        st.caption(f"storage `{DB_PATH}` — survives a refresh")
 
 
 # ── 1 · Ingest & inspect ──────────────────────────────────────────────────────

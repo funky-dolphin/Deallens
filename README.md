@@ -51,16 +51,20 @@ echo "ANTHROPIC_API_KEY=sk-ant-..." > .env
 The app opens in a browser. Upload a PDF on the first page, then use the
 sidebar to work through it.
 
-**Keeping your work between sessions.** By default everything lives in memory
-and disappears when you refresh the page. That is deliberate — it means two
-people using a shared copy never see each other's documents. If you are
-working on your own machine and want your data to persist, add this to `.env`:
+**What you start with.** The repository ships a sample database with three
+filings already read and extracted, so the app has something in it the first
+time you open it. You get your own private copy, and a refresh gives you a
+fresh one — anything you upload or correct is yours alone and does not last.
+
+**Keeping your own work.** If you want your uploads and corrections to
+survive a refresh, add this to `.env`:
 
 ```
 DEALLENS_DB=deallens.db
 ```
 
-Then reading a filing once is enough; you can close the browser and come back.
+Then the app uses that one file and everything persists. Use this on your own
+machine, not on a copy other people can reach.
 
 ---
 
@@ -76,6 +80,47 @@ price of a document without spending anything:
 
 ```bash
 .venv/bin/python scripts/estimate_cost.py "your-filing.pdf"
+```
+
+---
+
+## Hosting it
+
+The app runs on [Streamlit Community Cloud](https://share.streamlit.io) with
+no changes.
+
+1. Push the repository to GitHub.
+2. Create an app pointing at `app.py`, and choose **Python 3.11**.
+3. Under **Settings → Secrets**, paste the contents of
+   `.streamlit/secrets.toml.example` and fill in your API key.
+
+Set no other configuration. In particular, **do not set `DEALLENS_DB`** on a
+hosted copy — that points every visitor at one shared file, so they would see
+each other's filings and each other's corrections.
+
+**Reviewers arrive to finished work.** A sample database is committed
+(`deallens_seed.db`) carrying three filings already read and extracted: two US
+mergers and a German takeover offer. Each visitor gets their own private copy
+of it, so there is something to look at immediately and nobody has to spend
+money to see how it works.
+
+They can still upload a filing of their own, extract it, and correct fields in
+the review queue — all inside their own copy. Nothing they do affects anyone
+else, and a refresh gives them a clean copy of the samples again.
+
+**Your API key pays for any extraction a visitor runs.** Reading a filing is
+free, and the samples cost nothing because they are already done. But anyone
+who uploads a new PDF can spend $2 to $4 of your credit. There is a per-run
+ceiling in `app.py` (`MAX_COST_USD`), but no daily cap and no per-visitor
+limit. If the link is going further than a handful of reviewers, lower that
+ceiling or put the app behind a password.
+
+**Refreshing the samples.** The seed is a snapshot. If you re-extract or
+correct something locally and want reviewers to see it, copy your working
+database over the seed and commit it:
+
+```bash
+cp deallens.db deallens_seed.db
 ```
 
 ---
@@ -140,6 +185,7 @@ deallens/
 scripts/                pricing a run, exporting outputs
 tests/                  257 tests
 outputs/                extracted data for the three sample filings
+deallens_seed.db        those three filings, ready to open in the app
 ```
 
 ---

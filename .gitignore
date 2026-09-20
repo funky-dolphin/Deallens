@@ -5,7 +5,11 @@ __pycache__/
 .DS_Store
 .streamlit/secrets.toml
 .claude/
+# Working databases are local. The seed below is committed on purpose:
+# it carries the three case filings already ingested and extracted, so a
+# reviewer is not asked to spend money before seeing anything.
 *.db
 *.sqlite
+!deallens_seed.db
 .venv/
 .pytest_cache/
