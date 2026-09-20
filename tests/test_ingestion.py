@@ -105,7 +105,7 @@ def test_blank_pages_are_not_treated_as_scanned():
     report = check_integrity(load_pdf(_pdf(3), "blank.pdf"))
     assert report.requires_ocr is False
     assert report.blank_pages == [1, 2, 3]
-    assert report.ingestion_status != "blocked"
+    assert report.ingestion_status != "ocr_required"
 
 
 def test_identical_blank_pages_are_not_reported_as_duplicates():

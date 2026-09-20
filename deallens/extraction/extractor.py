@@ -660,8 +660,9 @@ def extract_document(
     """
     Extract structured fields from every extractable layer of one document.
 
-    Refuses to run when ingestion blocked the document: extracting around
-    pages we could not read yields a result that looks complete and is not.
+    An unreadable page stops nothing on its own. What matters is whether it
+    falls in a layer this run reads; where it does, the run proceeds and every
+    absence from that layer is qualified rather than reported as silence.
 
     `max_cost_usd` is a spend ceiling checked before the first request. A
     filing several times larger than expected, or one whose layers were

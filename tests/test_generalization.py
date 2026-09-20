@@ -133,7 +133,7 @@ def test_scanned_page_requires_ocr_and_blocks_extraction():
     )
     assert result.inventory.page(5).text_layer_status == "image_only"
     assert result.integrity.requires_ocr
-    assert result.integrity.ingestion_status == "blocked"
+    assert result.integrity.ingestion_status == "ocr_required"
     assert not result.may_extract
 
 

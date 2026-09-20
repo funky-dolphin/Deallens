@@ -68,14 +68,20 @@ class IntegrityReport:
     @property
     def ingestion_status(self) -> str:
         """
-        Whether this document is safe to extract from.
+        How completely this document was read.
 
-        `blocked` is reserved for defects that make extraction unsound: pages we
-        cannot read at all. Duplicates and label anomalies degrade citation
-        quality but do not invalidate the text we did read, so they warn.
+        `ocr_required` means some page carries content we cannot read at all.
+        It is a statement about the document, not a refusal: whether it stops
+        a run depends on where those pages fall, which only extraction knows
+        (`IngestionResult.unreadable_pages_in`). A filing whose investor deck
+        has an image-only slide is still a filing whose agreement reads
+        perfectly.
+
+        Duplicates and label anomalies degrade citation quality but do not
+        invalidate the text we did read, so they warn.
         """
         if self.requires_ocr:
-            return "blocked"
+            return "ocr_required"
         if self.has_errors:
             return "review_required"
         if self.issues:
@@ -164,7 +170,8 @@ def assess_readability(inventory: DocumentInventory) -> tuple[list[int], list[in
                 detail=(
                     f"{len(unreadable)} page(s) carry images but no text layer and "
                     "require OCR, which this pipeline does not perform. Extraction "
-                    "is blocked because content on these pages cannot be evidenced."
+                    "cannot be evidenced. Any layer containing one is reported as "
+                    "incomplete; layers that do not are unaffected."
                 ),
             )
         )

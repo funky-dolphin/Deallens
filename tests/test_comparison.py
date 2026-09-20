@@ -94,18 +94,20 @@ def test_case_and_whitespace_differences_are_a_normalized_match():
     assert result.classification == NORMALIZED_MATCH
 
 
-def test_a_shortened_party_name_is_a_conflict_not_a_match():
+def test_a_shortened_party_name_is_not_a_conflict():
     """
-    Normalization forgives presentation, never substance. "Bio-Techne" is not
-    "Bio-Techne Corporation", and deciding it is would be exactly the silent
-    reconciliation this module exists to prevent.
+    Revised after the Uber run. This was asserted as a conflict on the
+    reasoning that normalization forgives presentation and never substance --
+    but a summary naming "Bio-Techne" where the contract says "Bio-Techne
+    Corporation" is the short form of one name, not two companies. A
+    genuinely different name still conflicts; see the short-value test below.
     """
     result = compare_field(
         "target",
         _reading("Bio-Techne", layer="filing-summary"),
         _reading("Bio-Techne Corporation"),
     )
-    assert result.classification == CONFLICT
+    assert result.classification == NORMALIZED_MATCH
 
 
 def test_differing_values_are_a_conflict_and_neither_is_discarded():
@@ -411,8 +413,8 @@ def test_conflicts_sort_ahead_of_matches_within_a_category():
     rows = [
         _row("target", "filing-summary", "A"),
         _row("target", "agreement-ex2.1", "A"),
-        _row("acquirer", "filing-summary", "X"),
-        _row("acquirer", "agreement-ex2.1", "Y"),
+        _row("acquirer", "filing-summary", "Acme Corporation"),
+        _row("acquirer", "agreement-ex2.1", "Zenith Holdings"),
     ]
     results = compare_layers(rows)
     assert [r.classification for r in results] == [CONFLICT, MATCH]
@@ -448,3 +450,121 @@ def test_export_shape_carries_both_readings_and_both_locations():
     assert payload["summary_evidence"] and payload["agreement_evidence"]
     assert payload["preferred_layer"] == "agreement-ex2.1"
     assert payload["critical"] is True
+
+
+# ---------------------------------------------------------------------------
+# Narrative fields: a summary summarises
+# ---------------------------------------------------------------------------
+
+def _text(summary_value, agreement_value, field_name="other_regulatory_approvals"):
+    return compare_field(
+        field_name,
+        _reading(summary_value, layer="filing-summary"),
+        _reading(agreement_value, layer="agreement-ex2.1"),
+    )
+
+
+def test_the_same_provision_worded_differently_is_not_a_conflict():
+    """
+    Taken verbatim from the Uber / Delivery Hero run. These say the same
+    thing; calling them a conflict buried the one that mattered.
+    """
+    same_meaning = _text(
+        "at least 50% of the number of Delivery Hero Shares as of the expiration "
+        "of the acceptance period for the Offer plus one share, excluding treasury shares",
+        "at least 50% plus one (1) share (in words: fifty per cent plus one share) "
+        "of the Delivery Hero Shares, other than the Treasury Shares",
+        field_name="tender_acceptance_threshold",
+    )
+    assert same_meaning.classification == NORMALIZED_MATCH
+    assert "what a summary does" in same_meaning.reason
+
+
+def test_a_summary_and_the_detail_behind_it_are_not_a_conflict():
+    result = _text(
+        "the receipt of specified financial services regulatory approvals",
+        "Monetary Authority of Singapore approval under Art. 28 of the Payment "
+        "Services Act 2019; Bank of Greece; Central Bank of Turkey approvals",
+    )
+    assert result.classification == NORMALIZED_MATCH
+
+
+def test_clause_numbers_and_day_counts_are_not_disagreements():
+    """
+    Two layers citing different clauses is not two layers disagreeing, so only
+    currency-prefixed amounts are compared inside prose.
+    """
+    result = _text(
+        "termination by either party because a competing offer is announced",
+        "termination pursuant to Clause 13.1(a)(ii) or 13.1(a)(i), within seven (7) "
+        "Business Days",
+        field_name="fee_triggers",
+    )
+    assert result.classification == NORMALIZED_MATCH
+
+
+def test_disagreeing_amounts_inside_prose_are_still_a_conflict():
+    """
+    The real finding from the Uber run: the 8-K describes a EUR 14.2bn bridge
+    facility and the agreement says EUR 11.5bn. That must survive the
+    loosening, and it is caught inside narrative text.
+    """
+    result = _text(
+        "Bridge Credit Agreement providing senior unsecured bridge loan commitments "
+        "in an aggregate amount of €14,200,000,000, among the Company as borrower",
+        "bridge facility arrangement providing committed financing of €11,500,000,000 "
+        "with multiple global financial institutions",
+        field_name="committed_financing",
+    )
+    assert result.classification == CONFLICT
+    assert "14200000000" in result.reason.replace(",", "")
+    assert "11500000000" in result.reason.replace(",", "")
+
+
+def test_matching_amounts_inside_prose_are_not_a_conflict():
+    result = _text(
+        "a bridge facility of €11,500,000,000 committed by the lenders",
+        "committed financing of EUR 11,500,000,000 under the Bridge Credit Agreement",
+        field_name="committed_financing",
+    )
+    assert result.classification == NORMALIZED_MATCH
+
+
+def test_typed_fields_are_still_compared_strictly():
+    """
+    The loosening is for narrative text only. Money, dates, percentages and
+    enums normalize to canonical values, where a difference IS the
+    disagreement.
+    """
+    money = compare_field(
+        "company_termination_fee",
+        _reading(250_000_000.0, "$250,000,000", layer="filing-summary"),
+        _reading(255_000_000.0, "$255,000,000", layer="agreement-ex2.1"),
+    )
+    date = compare_field(
+        "outside_date",
+        _reading("2027-01-01", layer="filing-summary"),
+        _reading("2027-06-25", layer="agreement-ex2.1"),
+    )
+    assert money.classification == CONFLICT
+    assert date.classification == CONFLICT
+
+
+def test_a_genuinely_different_short_value_is_still_a_conflict():
+    """
+    The narrative loosening must not reach party names. A shortened name is a
+    summary using a short form; a different name is a different company.
+    """
+    shortened = compare_field(
+        "target",
+        _reading("Bio-Techne", layer="filing-summary"),
+        _reading("Bio-Techne Corporation", layer="agreement-ex2.1"),
+    )
+    different = compare_field(
+        "target",
+        _reading("Acme Corporation", layer="filing-summary"),
+        _reading("Bio-Techne Corporation", layer="agreement-ex2.1"),
+    )
+    assert shortened.classification == NORMALIZED_MATCH
+    assert "shorter form" in shortened.reason
+    assert different.classification == CONFLICT

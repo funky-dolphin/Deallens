@@ -198,10 +198,28 @@ def get_connection(path: str = ":memory:") -> sqlite3.Connection:
     return conn
 
 
+# Statuses are derived at ingestion and stored, so a change to how they are
+# derived leaves earlier rows holding the old vocabulary. `blocked` became
+# `ocr_required` when an unreadable page stopped being a whole-document
+# refusal: it now describes the document rather than announcing a decision,
+# and whether it stops a run depends on which layer the page falls in.
+_MIGRATIONS = (
+    "UPDATE documents SET ingestion_status = 'ocr_required' "
+    "WHERE ingestion_status = 'blocked'",
+)
+
+
 def initialize_schema(conn: sqlite3.Connection) -> sqlite3.Connection:
-    """Create all tables and indexes. Safe to call repeatedly."""
+    """
+    Create all tables and indexes, and bring stored values up to date.
+
+    Safe to call repeatedly, which is what lets the app call it on every
+    session against a database that may predate the current code.
+    """
     cursor = conn.cursor()
     for statement in _STATEMENTS:
+        cursor.execute(statement)
+    for statement in _MIGRATIONS:
         cursor.execute(statement)
     conn.commit()
     return conn

@@ -8,9 +8,9 @@ checked document ready for extraction:
 
 The pipeline returns a result rather than raising, because a document that
 fails an integrity control is still something the analyst needs to see and
-reason about. The one thing it will not do is hand a blocked document to the
-extractor: `IngestionResult.may_extract` gates that, and it is false whenever
-pages could not be read.
+reason about. Whether a document can be extracted from is a narrower
+question than whether it read cleanly -- see `unreadable_pages_in`, which
+asks only about the layers a run will actually open.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ class IngestionResult:
         see `unreadable_pages_in`, which asks the narrower question that
         actually governs a run.
         """
-        return self.integrity.ingestion_status != "blocked"
+        return self.integrity.ingestion_status != "ocr_required"
 
     def unreadable_pages_in(self, layer_ids: tuple[str, ...]) -> list[int]:
         """

@@ -233,6 +233,108 @@ def _raw_identical(left: str | None, right: str | None) -> bool:
     return _collapse(left) == _collapse(right)
 
 
+# Monetary amounts written inside narrative text: "$250,000,000",
+# "EUR 14,200,000,000", "€11.5 billion". Deliberately not every number -- a
+# clause reference, a section number and a count of business days are all
+# digits, and none of them disagreeing means the two layers disagree.
+_EMBEDDED_MONEY_RE = re.compile(
+    r"(?:[$€£¥]|\b(?:USD|EUR|GBP|JPY|CHF)\b)\s*"
+    r"(\d[\d,.]*)\s*(billion|million|bn|mm|m|b)?",
+    re.I,
+)
+_MONEY_SCALE = {"billion": 1e9, "bn": 1e9, "b": 1e9, "million": 1e6, "mm": 1e6, "m": 1e6}
+
+
+def _embedded_amounts(text: object) -> set[float]:
+    """Monetary amounts stated inside a narrative value."""
+    amounts: set[float] = set()
+    for digits, scale in _EMBEDDED_MONEY_RE.findall(str(text or "")):
+        try:
+            value = float(digits.replace(",", ""))
+        except ValueError:
+            continue
+        amounts.add(value * _MONEY_SCALE.get((scale or "").lower(), 1.0))
+    return amounts
+
+
+# Above this length a text value is prose describing a provision; below it,
+# it is an identifier -- a party name, a threshold, a short period. The two
+# need different treatment: prose is expected to differ between a summary and
+# the contract it summarises, whereas two different party names are two
+# different parties. The boundary is a heuristic, and deliberately generous
+# to the strict side.
+_NARRATIVE_LENGTH = 80
+
+
+def _is_narrative(summary: LayerReading, agreement: LayerReading) -> bool:
+    return max(
+        len(str(summary.normalized_value or "")),
+        len(str(agreement.normalized_value or "")),
+    ) > _NARRATIVE_LENGTH
+
+
+def _one_contains_the_other(left: object, right: object) -> bool:
+    """
+    Whether one short value is a condensation of the other.
+
+    "Bio-Techne" inside "Bio-Techne Corporation" is a summary using the short
+    form of a name, not a disagreement about which company is being bought.
+    "Acme Corp" against "Bio-Techne Corporation" contains nothing, and stays a
+    conflict.
+    """
+    a, b = _collapse(left).casefold(), _collapse(right).casefold()
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
+def _compare_text(
+    summary: LayerReading, agreement: LayerReading
+) -> tuple[str, str]:
+    """
+    Classify two narrative readings, in order of how much each test tells us.
+
+    Amounts first, because a figure stated in both is the strongest evidence
+    either way and does not depend on how long the surrounding prose is. Then
+    containment, which catches a summary using the short form of a name. Then
+    length, which decides what an unexplained difference means: in prose it
+    means the summary summarised, and in a short value it means the two
+    layers name different things.
+    """
+    left = _embedded_amounts(summary.normalized_value)
+    right = _embedded_amounts(agreement.normalized_value)
+
+    if left and right:
+        if left & right:
+            return NORMALIZED_MATCH, (
+                "Both layers describe this provision in different words but "
+                f"state the same amount(s): {sorted(left & right)}."
+            )
+        return CONFLICT, (
+            "Both layers describe this provision, and the monetary amounts "
+            f"they state disagree: {sorted(left)} against {sorted(right)}."
+        )
+
+    if _one_contains_the_other(summary.normalized_value, agreement.normalized_value):
+        return NORMALIZED_MATCH, (
+            "The filing summary states a shorter form of the same value "
+            f"({summary.normalized_value!r} within {agreement.normalized_value!r})."
+        )
+
+    if _is_narrative(summary, agreement):
+        return NORMALIZED_MATCH, (
+            "Both layers describe this provision in different words, which is "
+            "what a summary does. Narrative fields are not compared verbatim "
+            "and no conflicting amounts were found; both readings are shown "
+            "for a reviewer to judge."
+        )
+
+    return CONFLICT, (
+        f"The layers state different values: {summary.normalized_value!r} "
+        f"against {agreement.normalized_value!r}."
+    )
+
+
 def _values_equivalent(left: object, right: object) -> bool:
     """
     Same value, allowing for presentation differences.
@@ -332,6 +434,9 @@ def compare_field(
                 "Both layers report the same value, differing only in case or "
                 f"spacing ({summary.raw_value!r} and {agreement.raw_value!r})."
             )
+        elif spec is not None and spec.value_type == "text":
+            outcome = _compare_text(summary, agreement)
+            comparison.classification, comparison.reason = outcome
         else:
             comparison.classification = CONFLICT
             comparison.reason = (

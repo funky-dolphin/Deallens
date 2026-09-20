@@ -230,6 +230,26 @@ def _anthropic_client(api_key: str):
     return anthropic.Anthropic(api_key=api_key)
 
 
+def _value_cell(value) -> object | None:
+    """
+    One extracted value, rendered for reading.
+
+    Numbers get two decimals and thousands separators. A money field
+    normalizes to a float, so a EUR 14.2bn bridge facility arrives as
+    `14200000000.0` — technically the value and unreadable as a figure. Text,
+    dates and enums are left exactly as extracted, because the assignment
+    requires the source's own terminology be preserved.
+
+    Booleans are excluded explicitly: `bool` is a subclass of `int` in Python,
+    so a yes/no field would otherwise render as "1.00".
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return f"{value:,.2f}"
+    return value
+
+
 def _layer_cell(reading) -> object | None:
     """
     What one layer's value column shows.
@@ -240,7 +260,7 @@ def _layer_cell(reading) -> object | None:
     missing value rather than a deliberate one.
     """
     if reading.normalized_value is not None:
-        return reading.normalized_value
+        return _value_cell(reading.normalized_value)
     if reading.raw_value:
         return "withheld — see review queue"
     return None
@@ -388,7 +408,8 @@ if page.startswith("1"):
             "ingested": "OK",
             "ingested_with_warnings": "CHECK",
             "review_required": "CHECK",
-        }.get(status, "BLOCKED")
+            "ocr_required": "PARTIAL",
+        }.get(status, "CHECK")
 
         # Machine-readability decides whether extraction sends text or page
         # images, which is the largest cost lever in the pipeline, so it
@@ -404,10 +425,11 @@ if page.startswith("1"):
         for column, (label, value) in zip(st.columns(len(stats)), stats):
             _stat(column, label, value, alert=label == "Status" and badge != "OK")
 
-        if status == "blocked":
-            st.error(
-                "Extraction is blocked for this document: pages carry content that could "
-                "not be read. Extracting anyway would look complete and silently omit them."
+        if status == "ocr_required":
+            st.info(
+                "Some page in this document carries content with no text layer and "
+                "would need OCR. Whether that affects extraction depends on which "
+                "layer it falls in — see the Layers table below."
             )
 
         st.caption(
@@ -708,7 +730,7 @@ elif page.startswith("3"):
                             st.markdown(f"**{title}**")
                             if reading.raw_value or reading.evidence:
                                 st.markdown(
-                                    f"- value: `{reading.normalized_value}` "
+                                    f"- value: `{_value_cell(reading.normalized_value)}` "
                                     f"(raw: {reading.raw_value!r})\n"
                                     f"- page {reading.page} · {reading.section or 'no section'}\n"
                                     f"- status: `{reading.status}` · "
@@ -730,7 +752,7 @@ elif page.startswith("3"):
                             {
                                 "field": r["field_name"],
                                 "layer": r["document_layer"],
-                                "value": r["normalized_value"],
+                                "value": _value_cell(r["normalized_value"]),
                                 "ccy": r["currency"],
                                 "status": r["status"],
                                 "conf": r["confidence"],
@@ -921,15 +943,18 @@ elif page.startswith("5"):
                     )
                     st.write(
                         f"**This layer** (`{row['document_layer']}`): "
-                        f"{row['normalized_value']}  \n"
-                        f"**Other layer** (`{other['layer']}`): {other['value']} "
+                        f"{_value_cell(row['normalized_value'])}  \n"
+                        f"**Other layer** (`{other['layer']}`): "
+                        f"{_value_cell(other['value'])} "
                         f"— page {_page_cell(other['page'])}"
                     )
                     if other["evidence"]:
                         st.caption(f"other layer's evidence: “{other['evidence']}”")
 
                 st.write(f"**Raw value:** {row['raw_value'] or '—'}")
-                st.write(f"**Normalized:** {row['normalized_value'] or '—'}")
+                st.write(
+                    f"**Normalized:** {_value_cell(row['normalized_value']) or '—'}"
+                )
                 st.write(
                     f"**Confidence:** {row['confidence']:.2f} · "
                     f"**Layer:** {row['document_layer']} · "
@@ -989,7 +1014,7 @@ elif page.startswith("5"):
                     if outcome.accepted:
                         st.success(
                             f"`{outcome.field_name}` set to "
-                            f"`{outcome.normalized_value}` "
+                            f"`{_value_cell(outcome.normalized_value)}` "
                             f"(method `{outcome.extraction_method}`)."
                         )
                         if outcome.evidence_verified is False:
