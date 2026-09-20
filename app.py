@@ -55,6 +55,7 @@ from deallens.db import (
     save_ingestion,
     set_review_status,
 )
+from deallens.export import required_schema_json, workbook_bytes
 from deallens.extraction import (
     DEFAULT_MODEL_ID,
     EXTRACTABLE_LAYERS,
@@ -609,8 +610,9 @@ elif page.startswith("2"):
                         counts.get("conflict", 0) + counts.get("unresolved", 0),
                     )
                     st.caption(
-                        f"{run.total_input_tokens:,} input tokens "
-                        f"({run.total_cache_read_tokens:,} read from cache) · "
+                        f"{run.total_billed_input_tokens:,} input tokens "
+                        f"({run.total_cache_creation_tokens:,} written to cache, "
+                        f"{run.total_cache_read_tokens:,} read from it) · "
                         f"{run.total_output_tokens:,} output tokens"
                     )
 
@@ -618,6 +620,31 @@ elif page.startswith("2"):
                     with st.expander(f"Warnings ({len(run.warnings)})"):
                         for warning in run.warnings:
                             st.write(f"- {warning}")
+
+        st.divider()
+        st.subheader("Export the audit record")
+        st.caption(
+            "Everything in the database, one sheet per table, plus the "
+            "comparison, timeline and hedging analyses and the assumptions "
+            "behind them. Nothing is recomputed — the export reads the same "
+            "rows the application does, so it cannot disagree with what you "
+            "see on screen."
+        )
+        e1, e2 = st.columns(2)
+        e1.download_button(
+            "Download everything (Excel)",
+            data=workbook_bytes(conn),
+            file_name="deallens_audit_record.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+        )
+        e2.download_button(
+            "Extracted fields, required schema (JSON)",
+            data=required_schema_json(conn, document_id),
+            file_name=f"{document_id}_extracted_fields.json",
+            mime="application/json",
+            width="stretch",
+        )
 
 
 # ── 3 · Summary vs. agreement ─────────────────────────────────────────────────
