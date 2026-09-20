@@ -56,13 +56,36 @@ class IngestionResult:
     @property
     def may_extract(self) -> bool:
         """
-        Fail-closed gate on downstream extraction.
+        Whether the whole document read cleanly.
 
-        Blocked means pages carry content we cannot read. Extracting anyway
-        would produce results that look complete while silently omitting
-        whatever those pages said.
+        Kept for reporting: it is the honest answer to "did anything in this
+        file fail to read?". It is deliberately NOT the extraction gate --
+        see `unreadable_pages_in`, which asks the narrower question that
+        actually governs a run.
         """
         return self.integrity.ingestion_status != "blocked"
+
+    def unreadable_pages_in(self, layer_ids: tuple[str, ...]) -> list[int]:
+        """
+        Unreadable pages that fall inside the layers about to be extracted.
+
+        The distinction matters more than it looks. A filing can carry an
+        image-only page in an investor presentation while its operative
+        agreement reads perfectly, and refusing the whole document over the
+        first would decline a contract because a chart in a slide deck is a
+        picture. What governs a run is whether the pages *that run will read*
+        are readable.
+
+        A page outside those layers is still reported as an integrity issue;
+        it just does not block work it has no bearing on.
+        """
+        if not self.integrity.unreadable_pages:
+            return []
+        in_scope: set[int] = set()
+        for layer in self.layers:
+            if layer.layer_id in layer_ids:
+                in_scope.update(layer.body_pages())
+        return sorted(set(self.integrity.unreadable_pages) & in_scope)
 
     def locator_for(
         self,

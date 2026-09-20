@@ -57,6 +57,7 @@ from deallens.db import (
 )
 from deallens.extraction import (
     DEFAULT_MODEL_ID,
+    EXTRACTABLE_LAYERS,
     MODEL_PROFILES,
     PROMPT_VERSION,
     extract_document,
@@ -88,6 +89,30 @@ RULE = "#D8DEE8"
 st.markdown(
     f"""
     <style>
+      /* Serif for reading text. Deliberately NOT applied to every element:
+         Streamlit draws its chevrons, sort arrows and collapse controls as
+         ligatures in an icon font, and forcing a family onto every span
+         renders those as literal words or empty boxes. Only text-bearing
+         containers are named, and no !important, so anything that needs its
+         own face keeps it. */
+      html, body, button, input, textarea, select, label,
+      [data-testid="stMarkdownContainer"], [data-testid="stAlert"],
+      [data-testid="stDataFrame"], [data-testid="stMetricValue"],
+      h1, h2, h3, h4, h5, h6 {{
+        font-family: Georgia, "Times New Roman", Times, serif;
+      }}
+
+      /* Icon fonts keep theirs, whatever the rule above inherits into. */
+      [data-testid="stIconMaterial"], [class*="material-icons"],
+      [class*="material-symbols"], .material-icons {{
+        font-family: "Material Symbols Rounded", "Material Icons" !important;
+      }}
+
+      /* Read character by character, not as words. */
+      code, pre, kbd, samp {{
+        font-family: "Courier New", Consolas, monospace;
+      }}
+
       /* Tabular figures, so money and dates line up column to column. */
       [data-testid="stDataFrame"] {{ font-variant-numeric: tabular-nums; }}
 
@@ -391,22 +416,75 @@ if page.startswith("1"):
         )
 
         st.subheader("Layers")
+        st.caption(
+            "Extraction reads the filing summary and the operative agreement. "
+            "Other layers are ingested, stored and searchable, but no deal "
+            "terms are extracted from them — a press release or an investor "
+            "deck is not a source of contractual terms."
+        )
         layers = get_layers(conn, document_id)
         if layers:
+            unreadable = set(
+                issue_page
+                for issue in get_integrity_issues(conn, document_id)
+                if issue["kind"] == "unreadable_page"
+                for issue_page in issue["pdf_pages"]
+            )
+            table = []
+            extracted_pages = 0
+            for layer in layers:
+                span = range(layer["start_page"], layer["end_page"] + 1)
+                is_extracted = layer["layer_id"] in EXTRACTABLE_LAYERS
+                if is_extracted:
+                    extracted_pages += len(span)
+                in_layer = sorted(unreadable & set(span))
+                table.append(
+                    {
+                        "layer": layer["qualified_id"],
+                        "label": layer["label"],
+                        "pages": f"{layer['start_page']}–{layer['end_page']}",
+                        "count": len(span),
+                        "extracted": "Yes" if is_extracted else "No",
+                        "needs OCR": ", ".join(str(p) for p in in_layer),
+                        "detected via": layer["detection_method"],
+                    }
+                )
             st.dataframe(
-                pd.DataFrame(layers)[
-                    [
-                        "layer_id",
-                        "label",
-                        "exhibit_number",
-                        "start_page",
-                        "end_page",
-                        "detection_method",
-                    ]
-                ],
+                pd.DataFrame(table),
                 width="stretch",
                 hide_index=True,
+                height=_table_height(len(table)),
             )
+
+            skipped = [r for r in table if r["extracted"] == "No"]
+            if skipped:
+                st.caption(
+                    f"**{extracted_pages} of {doc['page_count']} pages will be "
+                    f"extracted.** Not read: "
+                    + "; ".join(f"`{r['layer']}` ({r['count']}pp)" for r in skipped)
+                    + "."
+                )
+            blocking = sorted(
+                unreadable
+                & {
+                    page
+                    for layer in layers
+                    if layer["layer_id"] in EXTRACTABLE_LAYERS
+                    for page in range(layer["start_page"], layer["end_page"] + 1)
+                }
+            )
+            if unreadable and not blocking:
+                st.caption(
+                    f"Page(s) {', '.join(str(p) for p in sorted(unreadable))} need OCR, "
+                    "but sit in layers extraction does not read, so they do not "
+                    "affect the run."
+                )
+            elif blocking:
+                st.caption(
+                    f"Page(s) {', '.join(str(p) for p in blocking)} need OCR and are "
+                    "inside a layer being extracted. Extraction will run and every "
+                    "absence from that layer will be qualified."
+                )
         else:
             st.warning("No layers were segmented.")
 
@@ -453,14 +531,30 @@ elif page.startswith("2"):
         )
         st.session_state.model_id = model_id
 
-        if not ingestion.may_extract:
-            st.error(
-                f"Extraction is blocked: ingestion status is "
-                f"'{ingestion.integrity.ingestion_status}'. "
-                f"{len(ingestion.integrity.unreadable_pages)} page(s) require OCR."
+        # An unreadable page only matters here if it is in a layer this run
+        # reads. One in an investor presentation has no bearing on the
+        # agreement, so it is reported and does not stop the run.
+        blocking = ingestion.unreadable_pages_in(EXTRACTABLE_LAYERS)
+        out_of_scope = sorted(
+            set(ingestion.integrity.unreadable_pages) - set(blocking)
+        )
+        if out_of_scope:
+            st.info(
+                f"{len(out_of_scope)} page(s) require OCR "
+                f"({', '.join(str(p) for p in out_of_scope[:8])}), but fall "
+                "outside the filing summary and the agreement. They do not "
+                "affect this extraction."
+            )
+        if blocking:
+            st.warning(
+                f"Incomplete source: {len(blocking)} page(s) "
+                f"({', '.join(str(p) for p in blocking[:8])}) inside the layers "
+                "being extracted could not be read. Extraction will run, and "
+                "every field reported as not found in an affected layer will "
+                "say so — an absence here does not mean the agreement is silent."
             )
 
-        if st.button("Run extraction", type="primary", disabled=not ingestion.may_extract):
+        if st.button("Run extraction", type="primary"):
             if not api_key:
                 st.error(
                     "No Anthropic API key found. Set `ANTHROPIC_API_KEY` in `.env`, "

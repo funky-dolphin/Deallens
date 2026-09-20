@@ -222,14 +222,33 @@ class DealCharacteristics:
 
 
 def deal_from_rows(rows: list[dict]) -> DealCharacteristics:
-    """Read the currency facts out of an extraction, via the source hierarchy."""
+    """
+    Read the currency facts out of an extraction.
+
+    The summary-vs-agreement comparison is consulted first, because it applies
+    the documented source hierarchy. It only spans those two layers, though,
+    and a bridge facility is attached as its own financing agreement -- so a
+    field it does not cover falls back to any asserted reading. Without that,
+    `bridge_currency` extracted from a credit agreement would never reach the
+    FX exposure it exists to drive.
+    """
     from ..comparison import compare_layers
+    from ..extraction import models as field_models
 
     values = {
         c.field_name: c.preferred_value
         for c in compare_layers(rows)
         if c.preferred_value is not None
     }
+    for row in rows:
+        name = row.get("field_name")
+        if (
+            name not in values
+            and row.get("status") == field_models.FOUND
+            and row.get("normalized_value") is not None
+        ):
+            values[name] = row["normalized_value"]
+
     return DealCharacteristics(
         consideration_currency=values.get("consideration_currency"),
         bridge_currency=values.get("bridge_currency"),

@@ -8,13 +8,20 @@ from .client import (
     profile_for,
     slice_pdf,
 )
-from .extractor import ExtractionRun, LayerExtraction, extract_document, extract_layer
+from .extractor import (
+    EXTRACTABLE_LAYERS,
+    ExtractionRun,
+    LayerExtraction,
+    extract_document,
+    extract_layer,
+)
 from .models import ExtractedField, finalise, not_applicable_field, validate
 from .prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_output_schema, build_user_prompt
 from .registry import BY_NAME, CRITICAL_FIELDS, FIELDS, FieldSpec, by_category, fields_for
 
 __all__ = [
     "BY_NAME",
+    "EXTRACTABLE_LAYERS",
     "CRITICAL_FIELDS",
     "FIELDS",
     "DEFAULT_MODEL_ID",

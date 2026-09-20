@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import pytest
 
+from deallens.extraction import models
 from deallens.ingestion import check_integrity, classify_structure, ingest, load_pdf, segment_layers
 from deallens.ingestion.loader import extract_printed_page_label
 
@@ -223,3 +224,76 @@ def test_unrecognised_structure_still_fails_closed():
     result = _ingest(["A notice about an annual general meeting.\n1"] * 4)
     assert result.structure.structure == "unknown"
     assert result.structure.review_status == "exception"
+
+
+# ---------------------------------------------------------------------------
+# Financing agreements attached as exhibits (WS7 schema extension)
+# ---------------------------------------------------------------------------
+
+def test_a_bridge_credit_agreement_is_recognised_as_its_own_layer():
+    """
+    The Uber filing attaches its bridge facility as Exhibit 10.1. Unmatched by
+    any instrument signature it fell through to a generic "exhibit" and was
+    never read, taking the whole financing category with it.
+    """
+    from deallens.ingestion.classifier import LAYER_CREDIT_AGREEMENT, _instrument_for
+
+    for heading in (
+        "BRIDGE CREDIT AGREEMENT Dated as of July 16, 2026",
+        "SENIOR FACILITIES AGREEMENT",
+        "COMMITMENT LETTER",
+        "INTERIM FACILITIES AGREEMENT",
+    ):
+        layer_id, label = _instrument_for(heading)
+        assert layer_id == LAYER_CREDIT_AGREEMENT, heading
+        assert label == "Financing agreement"
+
+
+def test_the_operative_agreement_still_wins_over_the_financing_signature():
+    """Signature order matters: a merger agreement is not a credit agreement."""
+    from deallens.ingestion.classifier import LAYER_AGREEMENT, _instrument_for
+
+    for heading in ("AGREEMENT AND PLAN OF MERGER", "BUSINESS COMBINATION AGREEMENT"):
+        assert _instrument_for(heading)[0] == LAYER_AGREEMENT
+
+
+def test_a_financing_agreement_is_extracted_but_only_for_financing_fields():
+    """
+    A credit agreement has its own material adverse effect clause, conditions
+    precedent and termination provisions -- all about the loan. Extracting the
+    full field set from it would answer merger questions from the wrong
+    contract.
+    """
+    from deallens.extraction.extractor import EXTRACTABLE_LAYERS, _specs_for_layer
+    from deallens.extraction.registry import FINANCING, fields_for
+
+    assert "credit-agreement" in EXTRACTABLE_LAYERS
+
+    specs = fields_for("takeover_offer")
+    scoped = _specs_for_layer("credit-agreement", specs)
+
+    assert len(scoped) == 10
+    assert {s.category for s in scoped} == {FINANCING}
+    assert "bridge_amount" in {s.name for s in scoped}
+    assert "material_adverse_effect_condition" not in {s.name for s in scoped}
+    # The operative agreement is still a source for everything.
+    assert len(_specs_for_layer("agreement", specs)) == len(specs)
+
+
+def test_a_bridge_currency_from_the_financing_layer_reaches_fx_exposure():
+    """
+    The comparison spans the summary and the agreement only, so a value read
+    from a financing agreement has to reach the analytics another way.
+    """
+    from deallens.analytics.hedging import deal_from_rows
+
+    rows = [{
+        "field_name": "bridge_currency", "document_layer": "credit-agreement-ex10.1",
+        "normalized_value": "EUR", "raw_value": "EUR", "status": models.FOUND,
+        "currency": None, "printed_page": "1", "pdf_page": 44, "section": None,
+        "evidence": "denominated in euro", "locator_uri": "d://x",
+        "confidence": 0.95, "review_status": models.UNREVIEWED,
+    }]
+    deal = deal_from_rows(rows)
+    assert deal.bridge_currency == "EUR"
+    assert deal.has_fx_exposure

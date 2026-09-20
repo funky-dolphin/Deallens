@@ -14,6 +14,8 @@ primaryColor = "#1A3668"
 backgroundColor = "#FFFFFF"
 secondaryBackgroundColor = "#F4F6F9"
 textColor = "#10192B"
+# Streamlit's own option only takes the generic families; the Arial stack
+# is applied in the stylesheet at the top of app.py.
 font = "sans serif"
 
 [server]

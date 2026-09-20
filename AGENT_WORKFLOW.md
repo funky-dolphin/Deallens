@@ -1,7 +1,79 @@
 # DealLens — Agent Workflow & Design Decisions
 
 ## Agent Used
-Claude Sonnet (claude.ai/code) — used for architecture design, code scaffolding, financial concept explanation, and iterative development.
+Claude Code (CLI), running Claude Opus 5 — architecture, implementation,
+test design, debugging and documentation, across the sessions logged below.
+
+The application itself calls `claude-opus-5` by default for extraction and
+for Q&A; `claude-sonnet-5` is selectable on the Extract page. Whichever
+model runs is recorded on the run and on every field it produces, so an
+output can be traced to the model that made it.
+
+---
+
+## What each part of the application is actually for
+
+Each workstream has an obvious reading and a more useful one. The obvious
+reading is what it does; the useful one is what it is protecting against.
+
+**WS1 — Ingestion** is not preparing the document for the model. It is
+deciding what the model is allowed to see. It reads every page, finds the
+exhibit boundaries, works out what instrument each one is, and only then
+decides which of them a question can be asked of. All of that is local and
+free; no API call happens until the targeting is settled. On the Uber filing
+it sends 126 of 149 pages — the press release and the investor deck are
+withheld not because they are unreadable but because a press release cannot
+tell you what the contract says.
+
+**WS2 — Extraction** does not produce answers. It produces claims, each of
+which has to survive four independent controls before it is allowed to become
+an answer: it must normalize unambiguously, its quote must be found on the
+page it cites, a page must have resolved at all, and its confidence must clear
+a bar that is higher for fields the assignment forbids inferring. A claim that
+fails any one of them is kept, with its raw text, and routed to a human — the
+value is withheld, never the evidence.
+
+**WS3 — Comparison** does not resolve a disagreement. It reports one. When
+the 8-K says "$250 million" and the agreement says "$250,000,000", that is a
+normalized match and worth knowing; when they say different things, that is
+the deliverable. An earlier version merged layers on highest-confidence-wins
+and would have destroyed the only evidence that the two documents differ,
+while looking more confident for doing it.
+
+**WS4 — Timeline** is mostly an exercise in restraint. Of the nine things it
+must cover, two are calendar dates; the rest are anchored to events that have
+not happened, conditioned on outcomes nobody knows, or frankly non-binding.
+Its value is in refusing to place "30 days after written notice" anywhere on a
+calendar, while still calculating the dates that genuinely follow from the
+agreement's own extension clause — and showing the arithmetic when it does.
+
+**WS5 — Hedging** is not asking what a hedge costs. It is asking which risks
+a hedge leaves you holding, and the answer is most of them. Separating the
+seven exposures is what makes that visible: a rate hedge neutralises the
+benchmark, converts it into swap-spread basis, and does nothing whatever about
+the issuer's own credit spread — so the credit scenario costs all three
+strategies the same. A single net P&L column would have hidden that.
+
+**WS6 — Q&A** never reads the filing. It reads what survived. Every control
+WS2 applied is therefore still in force at the moment of answering, and a
+question with no asserted evidence behind it returns the unsupported-answer
+sentence without an API call. The cost is real and stated: it can only answer
+what the 50-field registry covers.
+
+**WS7 — Generalization** is not a test of whether the pipeline works. It is a
+test of which assumptions were only ever true of the document they were
+written against. The extractable-layer whitelist looked correct for as long as
+the development filing was the only one in hand, and was falsified the first
+time a filing attached a credit agreement as an exhibit. That is the finding;
+the fix is the easy part.
+
+**WS8 — Controls** all answer one question: what would make this output wrong,
+and would anyone notice? Hence a locator that carries a content hash so a
+citation cannot drift off its evidence unnoticed, a model id recorded per
+field so a cheap run cannot be mistaken for an expensive one, and a manual
+correction that preserves the reading it superseded. A control that fails
+silently is worse than no control, because it also removes the suspicion that
+would have caught the error.
 
 ---
 
@@ -13,14 +85,23 @@ Claude Sonnet (claude.ai/code) — used for architecture design, code scaffoldin
 - **Rejected because**: Streamlit Cloud ephemeral filesystem would wipe ChromaDB on restart; Pinecone adds cost and API key complexity
 - **Chosen**: SQLite `:memory:` stored in `st.session_state` — per-session isolation, zero persistence issues, sufficient for structured field lookup
 
-**Decision**: Send PDF directly to Claude API as base64 document
-- **Considered**: pdfplumber, PyMuPDF, PyPDF2 to extract text first
-- **Rejected because**: Adds dependencies, loses layout/formatting context, lower accuracy on complex legal documents
-- **Chosen**: `{"type": "document", "source": {"type": "base64", ...}}` — Claude handles PDF parsing internally
+**Decision**: Send the PDF to the API as a base64 document block
+- **Considered**: extracting text locally first
+- **Rejected because**: adds dependencies, loses layout context
+- **Chosen**: `{"type": "document", "source": {"type": "base64", ...}}`
+
+> **Reversed in WS2.** A PDF block is billed as extracted text *and* a rendered
+> image of every page — roughly 2,700 tokens per page against 1,200 for the
+> same content as text. Ingestion already extracts and verifies the text, so
+> paying to have the pages rendered and read again buys nothing on a
+> machine-readable filing. Text is now sent wherever ingestion finds the text
+> layer trustworthy, and page images are reserved for pages that genuinely
+> need them. This cut input by 54%. The original reasoning was sound on its
+> own terms and was made before there was a local text layer worth trusting.
 
 **Decision**: Q&A via SQLite context injection, not RAG
 - **Considered**: Embedding chunks into ChromaDB, similarity search on questions
-- **Rejected because**: Over-engineered for 25 structured fields; extracted data is already compact and grounded
+- **Rejected because**: over-engineered for a bounded field set (now 50); the extracted data is already compact and grounded
 - **Chosen**: Concatenate all extracted fields as context string, pass to Claude with strict grounding instruction
 
 ---
@@ -72,23 +153,44 @@ module docstring in `prompts.py`.
 
 ## Hedging Model Design
 
-The hedging module implements the exact scenario matrix from the assignment:
+The hedging module runs the seven required scenarios against the three
+required strategies, and attributes every result across the seven risks the
+assignment requires be kept separate.
 
-| Scenario | Strategies |
-|----------|-----------|
-| Rates +25bps | Unhedged, Forward-Starting IRS, Deal-Contingent |
-| Rates -25bps | Unhedged, Forward-Starting IRS, Deal-Contingent |
-| Rates +50bps | Unhedged, Forward-Starting IRS, Deal-Contingent |
-| Rates +25bps + Credit Spread +20bps | Unhedged, Forward-Starting IRS, Deal-Contingent |
-| Base Case Close (85%) | Unhedged, Forward-Starting IRS, Deal-Contingent |
-| Delayed Close (10%) | Unhedged, Forward-Starting IRS, Deal-Contingent |
-| Transaction Failure (5%) | Unhedged, Forward-Starting IRS, Deal-Contingent |
+| Scenario | Source of its inputs |
+|---|---|
+| Rates +25bp / -25bp / +50bp | Assignment |
+| Parallel rate move + credit spread +20bp | Assignment; the rate move's size is assumed and stated |
+| Closing delayed to first extension date | **Dated from the WS4 timeline** |
+| Closing delayed to final extension date | **Dated from the WS4 timeline** |
+| Transaction failure | Assignment |
 
-DV01 formula: `(notional / $100M) × benchmark_DV01_per_$100M`
-= ($4B / $100M) × $65,000 = $2,600,000 per basis point
+| Risk reported separately | Who bears it |
+|---|---|
+| Benchmark rate | Unhedged only; both hedges neutralise it |
+| Swap spread | Hedgers only — the basis a rate hedge leaves behind |
+| Issuer credit spread | Everyone, in full. No rate hedge touches it |
+| FX | Read from the deal's extracted currencies, not assumed |
+| Timing | The conventional hedge, as carry across a delay |
+| Completion | The deal-contingent premium, paid in every scenario |
+| Unwind / breakage | The conventional hedge, on failure |
 
-P&L formula: `-DV01 × rate_shift_bps`
-(negative because rising rates hurt issuer's position)
+**Sign convention.** Positive is a gain to the issuer. The coupon is not yet
+fixed, so a rise in rates raises the future cost and is a loss.
+
+    DV01       = (notional / 100mm) x benchmark_DV01_per_100mm
+    rate P&L   = -DV01 x rate_shift_bps
+    carry      = notional x (swap_rate - treasury_rate) x delay_days / 365
+
+Delay days come from the timeline rather than being derived here: two modules
+computing a close date from the same agreement is two chances to disagree
+about it.
+
+Inputs the assignment does not supply live in `ADDITIONAL_ASSUMPTIONS`, each
+with the reason it is required — the unspecified size of the parallel rate
+move, the deal-contingent premium, the unwind bid-offer, and the use of one
+supplied DV01 for credit-spread and swap-spread moves as well as benchmark
+ones.
 
 ---
 
@@ -112,10 +214,37 @@ P&L formula: `-DV01 × rate_shift_bps`
       `(document_id, question)` would make repeat asks free and is roughly ten
       lines — not done, and worth stating in the productionization roadmap
       rather than quietly fixing
-- [ ] WS7: Hedging assumptions not yet adapted for Organon and Uber deals
-- [ ] Live extraction against the Bio-Techne 8-K not yet run. Ingestion runs
-      end to end on it (99 pages, 3 layers, `merger` at 1.00 confidence) and
-      the run prices at $1.70-$2.95; the paid call is the step still outstanding
+- [ ] **The OCR block is right but too coarse — scope it to the layers being
+      extracted.** Uber / Delivery Hero ingests 148 of its 149 pages cleanly.
+      The one failure is page 148: slide 15 of the investor presentation in
+      `exhibit-ex99.2`, a single flattened JPEG with no text layer. That is
+      correctly flagged `image_only` — there is demonstrably content there and
+      we cannot read a word of it. But `may_extract` then blocks the whole
+      document, and the page sits in a layer extraction never opens, so a
+      Business Combination Agreement is refused over a chart in a slide deck.
+      The fix is to ask whether any page *in the extractable layers* is
+      unreadable rather than any page at all, keeping an absolute block when
+      the filing summary or the agreement is affected. Left in place for now
+      on purpose: it loosens a fail-closed rule, and the finding is worth more
+      than the patch. A vision-model or OCR fallback for `image_only` pages is
+      the fuller answer and a natural next capability
+- [ ] **`EXTRACTABLE_LAYERS` misses financing exhibits.** Uber's bridge
+      facility terms live in `exhibit-ex10.1` (83 pages), which extraction
+      does not open, so the entire financing category has no source for that
+      deal. Extending the layer set is a real schema extension, not a
+      configuration tweak, and it raises the run cost materially
+- [ ] WS7: extraction and cross-transaction analysis for Organon and Uber;
+      hedging assumptions not yet adapted per deal
+- [ ] **No live extraction has been run against any of the three case
+      filings.** Ingestion runs end to end on all three and each prices
+      offline; the paid calls are the step still outstanding, and they block
+      the machine-readable extraction outputs deliverable:
+
+      | Filing | Pages | Layers | Structure | Estimate |
+      |---|---|---|---|---|
+      | development (US merger) | 99 | 3 | `merger` 1.00 | $1.64–2.89 |
+      | validation 1 (US merger) | 109 | 4 | `merger` 0.73 | $1.74–2.99 |
+      | validation 2 (German takeover) | 149 | 5 | `takeover_offer` 0.87 | $2.34–4.22 |
 - [ ] Streamlit Cloud deployment not yet done
 
 ---

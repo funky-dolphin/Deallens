@@ -44,11 +44,42 @@ from .client import (
 )
 from .models import ExtractedField
 from .prompts import PROMPT_VERSION, SYSTEM_PROMPT, build_output_schema, build_user_prompt
-from .registry import FieldSpec, fields_for, inapplicable_fields
+from .registry import FINANCING, FieldSpec, fields_for, inapplicable_fields
 
 # Layers worth extracting from, in the order they are reported. Constitutional
-# documents and press releases are not sources of deal terms.
-EXTRACTABLE_LAYERS = ("filing-summary", "agreement")
+# documents, press releases and investor presentations are not sources of deal
+# terms.
+#
+# `credit-agreement` was added after the Uber / Delivery Hero filing: its
+# bridge facility is attached as Exhibit 10.1, 84 pages that state the bridge
+# amount, maturity, interest basis and fees ten of our fields ask for. The
+# original two-layer list was drawn around the development filing, whose only
+# other exhibit was a two-page charter, and generalised "these two exhibit
+# kinds are not sources" into "nothing else is a source". A financing
+# agreement is a second operative contract, not supporting material.
+EXTRACTABLE_LAYERS = ("filing-summary", "agreement", "credit-agreement")
+
+# What each layer is a source *for*. A credit agreement has its own material
+# adverse effect clause, its own conditions precedent and its own termination
+# provisions -- all about the loan, not the merger. Extracting the full field
+# set from it would return confident answers to the wrong questions, so it is
+# scoped to the category it actually speaks to. `None` means every applicable
+# field.
+LAYER_FIELD_CATEGORIES: dict[str, tuple[str, ...] | None] = {
+    "filing-summary": None,
+    "agreement": None,
+    "credit-agreement": (FINANCING,),
+}
+
+
+def _specs_for_layer(
+    layer_id: str, specs: tuple[FieldSpec, ...]
+) -> tuple[FieldSpec, ...]:
+    """Narrow the field set to what a given layer is a source for."""
+    categories = LAYER_FIELD_CATEGORIES.get(layer_id)
+    if categories is None:
+        return specs
+    return tuple(spec for spec in specs if spec.category in categories)
 
 # Rough output cost per request: 48 fields with evidence quotes, plus adaptive
 # thinking at high effort. Used only for the pre-flight estimate.
@@ -439,7 +470,7 @@ def estimate_run(
             len(SYSTEM_PROMPT)
             + len(
                 build_user_prompt(
-                    specs,
+                    _specs_for_layer(layer.layer_id, specs),
                     layer_label=f"{layer.label} ({layer.qualified_id})",
                     structure=ingestion.structure.structure,
                     page_range=(pages[0], pages[-1]),
@@ -594,6 +625,30 @@ def extract_layer(
     return result
 
 
+def _qualify_absences(extraction: LayerExtraction, unreadable: list[int]) -> None:
+    """
+    Mark every absence from a layer we could not read in full.
+
+    A field reported `not_found` normally means the layer does not state it.
+    Where part of that layer is unreadable, the honest claim is weaker: we did
+    not find it in the part we could read. Leaving the two indistinguishable
+    is how a hole in the source becomes a finding about the agreement.
+    """
+    if not unreadable:
+        return
+    pages = ", ".join(str(p) for p in unreadable)
+    extraction.warnings.append(
+        f"Layer {extraction.layer_id} contains {len(unreadable)} unreadable "
+        f"page(s) ({pages}); absences below are qualified."
+    )
+    for record in extraction.fields:
+        if record.status == models.NOT_FOUND:
+            record.add_note(
+                f"Not found in the readable part of this layer. Page(s) {pages} "
+                "could not be read and may state this field."
+            )
+
+
 def extract_document(
     client,
     ingestion: IngestionResult,
@@ -627,13 +682,32 @@ def extract_document(
         prompt_version=PROMPT_VERSION,
     )
 
-    if not ingestion.may_extract:
-        run.error = (
-            f"Extraction blocked: ingestion status is "
-            f"'{ingestion.integrity.ingestion_status}'. "
-            f"{len(ingestion.integrity.unreadable_pages)} page(s) require OCR."
+    # An unreadable page only bears on this run if it sits in a layer this run
+    # reads. One in an investor presentation has no bearing on the agreement,
+    # and refusing the document over it declines a contract because a chart is
+    # a picture. Where a page IS in scope, extraction proceeds rather than
+    # stopping -- a partial result a reader can trust the boundaries of beats
+    # no result -- but every absence from the affected layer is qualified,
+    # because "not found" and "not found, and we could not read everything"
+    # are different claims.
+    blocking = ingestion.unreadable_pages_in(layer_ids)
+    out_of_scope = sorted(
+        set(ingestion.integrity.unreadable_pages) - set(blocking)
+    )
+    if out_of_scope:
+        run.warnings.append(
+            f"{len(out_of_scope)} unreadable page(s) "
+            f"({', '.join(str(p) for p in out_of_scope[:8])}) require OCR but "
+            "fall outside the layers being extracted, so they do not affect "
+            "this run."
         )
-        return run
+    if blocking:
+        run.warnings.append(
+            f"INCOMPLETE SOURCE: {len(blocking)} page(s) "
+            f"({', '.join(str(p) for p in blocking[:8])}) inside the extracted "
+            "layers could not be read and require OCR. Fields reported as not "
+            "found may be stated on those pages."
+        )
 
     structure = ingestion.structure.structure
     specs = fields_for(structure)
@@ -652,11 +726,18 @@ def extract_document(
         )
         return run
 
+    unreadable_by_layer = {
+        layer.qualified_id: sorted(set(blocking) & set(layer.body_pages()))
+        for layer in targets
+    }
+
     for layer in targets:
         try:
             extraction = extract_layer(
-                client, ingestion, layer, pdf_bytes, specs, profile
+                client, ingestion, layer, pdf_bytes,
+                _specs_for_layer(layer.layer_id, specs), profile,
             )
+            _qualify_absences(extraction, unreadable_by_layer.get(layer.qualified_id, []))
         except Exception as exc:
             run.warnings.append(f"Layer {layer.qualified_id} failed: {exc}")
             continue

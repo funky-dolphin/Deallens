@@ -49,6 +49,7 @@ from .loader import DocumentInventory
 
 LAYER_FILING_SUMMARY = "filing-summary"
 LAYER_AGREEMENT = "agreement"
+LAYER_CREDIT_AGREEMENT = "credit-agreement"
 LAYER_PRESS_RELEASE = "press-release"
 LAYER_GOVERNING_DOCS = "governing-documents"
 LAYER_EXHIBIT = "exhibit"
@@ -91,6 +92,18 @@ _INSTRUMENT_SIGNATURES: tuple[tuple[str, re.Pattern, str], ...] = (
         r"|SCHEME\s+IMPLEMENTATION\s+(?:AGREEMENT|DEED)"
         r"|ARRANGEMENT\s+AGREEMENT"
         r"|OFFER\s+DOCUMENT", re.I), "Operative agreement"),
+    # A financing agreement attached to the filing is a second operative
+    # contract, not supporting material: it binds the acquirer to its lenders
+    # and states the bridge amount, maturity, interest basis and fees the
+    # financing fields ask for. Unmatched, it fell through to a generic
+    # "exhibit" and was never read.
+    (LAYER_CREDIT_AGREEMENT, re.compile(
+        r"BRIDGE\s+CREDIT\s+AGREEMENT"
+        r"|BRIDGE\s+(?:TERM\s+)?(?:LOAN\s+)?(?:FACILITY\s+)?AGREEMENT"
+        r"|CREDIT\s+AGREEMENT"
+        r"|(?:SENIOR\s+)?FACILIT(?:Y|IES)\s+AGREEMENT"
+        r"|COMMITMENT\s+LETTER"
+        r"|INTERIM\s+FACILIT(?:Y|IES)\s+AGREEMENT", re.I), "Financing agreement"),
     (LAYER_PRESS_RELEASE, re.compile(r"PRESS\s+RELEASE|FOR\s+IMMEDIATE\s+RELEASE", re.I), "Press release"),
     (LAYER_GOVERNING_DOCS, re.compile(
         r"(?:AMENDED\s+AND\s+RESTATED\s+)?(?:ARTICLES\s+OF\s+INCORPORATION"
@@ -279,6 +292,7 @@ def segment_layers(inventory: DocumentInventory) -> list[DocumentLayer]:
 _LAYER_LABELS = {
     LAYER_FILING_SUMMARY: "Filing summary",
     LAYER_AGREEMENT: "Operative agreement",
+    LAYER_CREDIT_AGREEMENT: "Financing agreement",
     LAYER_PRESS_RELEASE: "Press release",
     LAYER_GOVERNING_DOCS: "Constitutional documents",
     LAYER_EXHIBIT: "Exhibit",

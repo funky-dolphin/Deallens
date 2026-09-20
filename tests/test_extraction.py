@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from deallens.extraction import models, validate
+from deallens.extraction import EXTRACTABLE_LAYERS, models, validate
 from deallens.extraction.extractor import (
     extract_document,
     extract_layer,
@@ -356,14 +356,77 @@ def test_disagreeing_chunks_produce_a_conflict_not_a_winner():
 # Blocked documents and schema validation
 # ---------------------------------------------------------------------------
 
-def test_extraction_refuses_to_run_on_a_blocked_document():
-    pages = agreement_pages(body_pages=3) + [""]
-    blocked = ingest(make_pdf(pages, with_image_on={4}), "scanned.pdf", run_id="r")
-    assert not blocked.may_extract
+def _with_unreadable_page(unreadable_in_agreement: bool):
+    """A composite filing with one image-only page, in or out of scope."""
+    body = agreement_pages(body_pages=4)
+    if unreadable_in_agreement:
+        body[2] = ""  # inside the agreement layer
+        image_page = 3 + 3  # cover + item + exhibit cover, then body index 2
+        pages = [
+            sec_cover_page(),
+            "Item 1.01 Entry into a Material Definitive Agreement.",
+            exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER"),
+        ] + body
+    else:
+        pages = [
+            sec_cover_page(),
+            "Item 1.01 Entry into a Material Definitive Agreement.",
+            exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER"),
+        ] + body + [exhibit_cover("99.1", "PRESS RELEASE"), ""]
+        image_page = len(pages)
+    pdf = make_pdf(pages, with_image_on={image_page})
+    return ingest(pdf, "scanned.pdf", run_id="r"), pdf, image_page
 
-    run = extract_document(FakeClient(), blocked, b"")
-    assert run.error and "blocked" in run.error
-    assert run.fields == []
+
+def test_an_unreadable_page_outside_the_extracted_layers_does_not_stop_a_run():
+    """
+    A filing can carry an image-only page in a press release while its
+    agreement reads perfectly. Refusing the document over the first would
+    decline a contract because a picture is a picture.
+    """
+    ingestion, pdf, page = _with_unreadable_page(unreadable_in_agreement=False)
+    assert page in ingestion.integrity.unreadable_pages
+    assert ingestion.unreadable_pages_in(EXTRACTABLE_LAYERS) == []
+
+    run = extract_document(FakeClient(), ingestion, pdf)
+
+    assert run.error is None, "the run proceeds"
+    assert run.fields, "fields were extracted"
+    assert any("do not affect this run" in w for w in run.warnings)
+
+
+def test_an_unreadable_page_inside_an_extracted_layer_qualifies_every_absence():
+    """
+    Extraction still runs -- a partial result whose boundaries a reader can
+    see beats no result. But "not found" and "not found, and we could not read
+    everything" are different claims, and the second has to say so.
+    """
+    ingestion, pdf, page = _with_unreadable_page(unreadable_in_agreement=True)
+    blocking = ingestion.unreadable_pages_in(EXTRACTABLE_LAYERS)
+    assert blocking, "the page is inside the agreement layer"
+
+    run = extract_document(FakeClient(), ingestion, pdf)
+
+    assert run.error is None
+    assert any("INCOMPLETE SOURCE" in w for w in run.warnings)
+
+    agreement_absences = [
+        f for f in run.fields
+        if f.status == models.NOT_FOUND and (f.document_layer or "").startswith("agreement")
+    ]
+    assert agreement_absences
+    assert all(
+        any("could not be read and may state this field" in n for n in f.notes)
+        for f in agreement_absences
+    ), "an absence from a partly unreadable layer must be qualified"
+
+
+def test_a_clean_document_carries_no_incompleteness_warning(ingested, composite_pdf):
+    run = extract_document(FakeClient(), ingested, composite_pdf)
+    assert not any("INCOMPLETE SOURCE" in w for w in run.warnings)
+    assert all(
+        not any("could not be read" in n for n in f.notes) for f in run.fields
+    )
 
 
 def test_validation_rejects_a_found_field_with_no_evidence():

@@ -151,10 +151,74 @@ are marked `critical`** and held to a 0.75 confidence bar rather than 0.60.
 - Bio-Techne / Merck KGaA (development)
 - Organon / Sun Pharma (validation 1)
 - Uber / Delivery Hero (validation 2)
-- **TODO**: neither validation filing has been downloaded or run. The
-  cross-transaction analysis is a report on how the *pipeline* coped, not a
-  comparison of deal terms: what generalized, what needed a schema extension,
-  what failed, and extraction performance by document
+**Ingestion run against all three (extraction still outstanding):**
+
+| | Bio-Techne | Organon | Uber / Delivery Hero |
+|---|---|---|---|
+| pages | 99 | 109 | 149 |
+| structure | `merger` 1.00 | `merger` 0.73 | `takeover_offer` 0.87 |
+| machine-readable | yes | yes | no |
+| layers | 3 | 4 | 5 |
+| may extract | yes | yes | **no** |
+| estimated cost | $1.64–2.89 | $1.74–2.99 | $1.25–2.50 |
+
+- **The classifier identified the German takeover offer unprompted**, on
+  evidence it found itself: "voluntary public takeover offer",
+  "Wertpapiererwerbs" (the German Takeover Act), "BaFin", "acceptance
+  period". No transaction-specific code was added for it
+- Organon classifies as `merger` at 0.73 against Bio-Techne's 1.00 — correct,
+  but on thinner evidence, and worth reporting rather than rounding up
+- **Uber blocks on one page in 149.** Page 148 is slide 15 of the investor
+  presentation in `exhibit-ex99.2`: a single flattened 1095x614 JPEG with a
+  three-whitespace-character text layer. 148 of 149 pages yield text; that one
+  needs OCR, which this pipeline does not do
+- The block is **correct but coarse**, and is being left in place
+  deliberately. `may_extract` asks "is any page in this file unreadable?" when
+  the governing question is "is any page in the layers I am about to read
+  unreadable?" The offending page sits in a layer extraction never opens, so a
+  Business Combination Agreement is being refused over a chart in a slide
+  deck. Narrowing the scope is a roadmap item rather than a quick fix: it
+  loosens a fail-closed rule, and a validation case that surfaces the
+  distinction is worth more as a finding than as a patch
+**Schema extension #1: financing agreements (applied).** Uber attaches its
+bridge facility as Exhibit 10.1 — confirmed as a `BRIDGE CREDIT AGREEMENT`
+dated 16 July 2026, Uber as borrower, Morgan Stanley Senior Funding as
+administrative agent, 83 pages. It matched no instrument signature, so it fell
+through to a generic `exhibit`, and `EXTRACTABLE_LAYERS` covered only
+`filing-summary` and `agreement`. The whole financing category — ten fields —
+had no source, and Uber priced *below* Bio-Techne despite being half again as
+long, because it was costing 43 of 149 pages.
+
+Nothing had failed. Ingestion segmented the layer, read all 83 pages, stored
+their text, and honestly reported it as an unidentified exhibit. The gap was a
+whitelist in extraction drawn around the development filing, whose only other
+exhibit is a two-page charter. Against that document, "these two exhibit kinds
+are not sources" and "nothing else is a source" are indistinguishable. Uber is
+the first document where they diverge — which is what an out-of-sample case is
+for.
+
+Two modular changes, neither specific to Uber:
+
+- a `credit-agreement` instrument signature matching `BRIDGE CREDIT
+  AGREEMENT`, `CREDIT AGREEMENT`, `FACILITIES AGREEMENT`, `COMMITMENT LETTER`
+  and `INTERIM FACILITIES AGREEMENT`, ordered after the operative-agreement
+  signature so a merger agreement still classifies as `agreement`
+- the layer added to `EXTRACTABLE_LAYERS`, scoped through
+  `LAYER_FIELD_CATEGORIES` to the financing category only. A credit agreement
+  has its own material adverse effect clause, conditions precedent and
+  termination provisions, all about the loan; asking it the full field set
+  would return confident answers to merger questions from the wrong contract
+
+Uber now reads **126 of 149 pages** (was 43) at $2.34–4.22 (was $1.25–2.50).
+Bio-Techne and Organon are unchanged — neither attaches a financing agreement.
+`deal_from_rows` also needed to fall back beyond the summary-vs-agreement
+comparison, or a `bridge_currency` read from the financing layer would never
+have reached the FX exposure it exists to drive.
+
+- **TODO**: extraction against all three, then the cross-transaction analysis.
+  That analysis is a report on how the *pipeline* coped, not a comparison of
+  deal terms: what generalized, what needed a schema extension, what failed,
+  and extraction performance by document
 - The architecture anticipates it — `applies_to` already narrows the field set
   per structure, the classifier has tender-offer and German-takeover paths,
   `normalize_currency` handles EUR, and FX exposure reads the extracted
@@ -224,6 +288,8 @@ deallens/
     pipeline.py             ingest(): the one entry point
   extraction/               WS2
     registry.py             the 50 field specs and what they apply to
+                            EXTRACTABLE_LAYERS / LAYER_FIELD_CATEGORIES
+                            in extractor.py decide which layer answers what
     prompts.py              system prompt + per-layer user prompt + output schema
     client.py               Claude call, token budget, pricing constants
     normalize.py            money/date/percent normalization
@@ -239,6 +305,47 @@ scripts/estimate_cost.py    price a run from the CLI, offline
 .streamlit/config.toml      theme: navy, red, white
 tests/                      216 tests
 ```
+
+## Data flow
+
+One table is the hub. Extraction writes to `extracted_fields`; every section
+of the application reads from it. Nothing downstream re-reads the PDF, and no
+section filters by which layer a row came from.
+
+```
+  PDF ──> ingestion ──> documents / document_pages / document_layers
+                             │
+                             ▼
+                        extraction ──> extracted_fields
+                                            │
+            ┌───────────────┬───────────────┼───────────────┬───────────────┐
+            ▼               ▼               ▼               ▼               ▼
+      WS3 comparison   WS4 timeline    WS5 hedging      WS6 Q&A       WS8 review
+      summary vs.      date kinds,     currency from    context from   exceptions +
+      agreement        horizon         the rows         asserted rows  conflicts
+                            │               ▲
+                            └── horizon ────┘
+```
+
+Each reader derives, it does not re-extract. The comparison classifies pairs
+of rows; the timeline classifies dates among them and computes the hedge
+horizon; hedging consumes that horizon rather than deriving its own close
+date; Q&A builds its context from asserted rows only; review surfaces the rows
+a control withheld plus the pairs the comparison finds in conflict. A manual
+correction writes back to the same table, so it reaches all five.
+
+Only two decisions happen *before* the table, and both are about which
+document is asked what:
+
+- **`EXTRACTABLE_LAYERS`** — which layers are opened at all. A press release
+  and a charter exhibit are ingested, stored and searchable, but they cannot
+  tell you what the contract says.
+- **`LAYER_FIELD_CATEGORIES`** — what each opened layer is a source *for*.
+  Classifying a layer tells you what kind of document it is, and that decides
+  which questions it can answer. The filing summary and the agreement answer
+  all of them; a financing agreement is authoritative but on a narrower set.
+
+---
 
 ## Database schema
 
