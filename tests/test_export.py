@@ -127,3 +127,53 @@ def test_an_oversized_cell_is_truncated_rather_than_failing_the_export(populated
     cell = sheet.cell(row=2, column=header.index("text") + 1).value
     assert len(cell) < 33_000
     assert "truncated" in cell
+
+
+def test_a_workbook_can_be_scoped_to_one_document(populated):
+    """
+    An audit record for one transaction should not carry two others, so every
+    sheet narrows — not just the documents sheet.
+    """
+    conn, document_id = populated
+    # A second document, so there is something to exclude.
+    other = make_pdf(
+        [sec_cover_page(), "Item 1.01 Entry into a Material Definitive Agreement.",
+         exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")]
+        + agreement_pages(body_pages=3)
+    )
+    second = ingest(other, "other.pdf", run_id="other-run")
+    save_ingestion(conn, second)
+    save_extraction(conn, extract_document(FakeClient(), second, other))
+
+    both = openpyxl.load_workbook(io.BytesIO(workbook_bytes(conn)))
+    one = openpyxl.load_workbook(io.BytesIO(workbook_bytes(conn, [document_id])))
+
+    assert both["documents"].max_row - 1 == 2
+    assert one["documents"].max_row - 1 == 1
+    assert one["extracted_fields"].max_row < both["extracted_fields"].max_row
+    assert one["document_pages"].max_row < both["document_pages"].max_row
+
+    ids = {
+        one["extracted_fields"].cell(row=r, column=2).value
+        for r in range(2, one["extracted_fields"].max_row + 1)
+    }
+    assert ids == {document_id}, "no other document's rows leak in"
+
+
+def test_scoping_narrows_the_runs_sheet_too(populated):
+    """
+    `runs` has no document_id — it is filtered through the run ids the chosen
+    documents were produced under, or an export of one filing carries the run
+    history of every other.
+    """
+    conn, document_id = populated
+    other = make_pdf([sec_cover_page(), "Item 1.01.", exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")] + agreement_pages(body_pages=3))
+    save_ingestion(conn, ingest(other, "other.pdf", run_id="other-run"))
+
+    one = openpyxl.load_workbook(io.BytesIO(workbook_bytes(conn, [document_id])))
+    run_ids = {
+        one["runs"].cell(row=r, column=1).value
+        for r in range(2, one["runs"].max_row + 1)
+    }
+    assert "other-run" not in run_ids
+    assert "export-test" in run_ids

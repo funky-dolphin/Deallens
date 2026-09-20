@@ -25,6 +25,7 @@ from __future__ import annotations
 import io
 import json
 import sqlite3
+from collections.abc import Sequence
 
 import pandas as pd
 
@@ -118,7 +119,38 @@ def required_schema_json(conn: sqlite3.Connection, document_id: str) -> str:
     return json.dumps(required_schema_records(conn, document_id), indent=2, default=str)
 
 
-def _derived_frames(conn: sqlite3.Connection) -> dict[str, pd.DataFrame]:
+def _scope(
+    table: str, document_ids: Sequence[str] | None
+) -> tuple[str, tuple]:
+    """
+    A SELECT restricted to the chosen documents.
+
+    `runs` is the one table with no `document_id`: it records analytical runs,
+    which a document belongs to rather than owns. It is filtered through the
+    run ids the chosen documents were produced under, so an export of one
+    filing does not carry the run history of the others.
+    """
+    if not document_ids:
+        return f"SELECT * FROM {table}", ()
+
+    placeholders = ",".join("?" for _ in document_ids)
+    if table == "runs":
+        return (
+            f"SELECT * FROM runs WHERE run_id IN ("
+            f"SELECT run_id FROM documents WHERE document_id IN ({placeholders})"
+            f" UNION SELECT run_id FROM extraction_runs"
+            f" WHERE document_id IN ({placeholders}))",
+            tuple(document_ids) * 2,
+        )
+    return (
+        f"SELECT * FROM {table} WHERE document_id IN ({placeholders})",
+        tuple(document_ids),
+    )
+
+
+def _derived_frames(
+    conn: sqlite3.Connection, document_ids: Sequence[str] | None = None
+) -> dict[str, pd.DataFrame]:
     """
     The analyses built on top of the tables.
 
@@ -128,7 +160,8 @@ def _derived_frames(conn: sqlite3.Connection) -> dict[str, pd.DataFrame]:
     rebuilt at export time from the same rows the application uses.
     """
     comparisons, timelines, scenarios = [], [], []
-    for doc in conn.execute("SELECT document_id, filename FROM documents"):
+    query, params = _scope("documents", document_ids)
+    for doc in conn.execute(query.replace("*", "document_id, filename"), params):
         rows = get_extracted_fields(conn, doc["document_id"])
         if not rows:
             continue
@@ -167,23 +200,30 @@ def _assumptions_frame() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def workbook_bytes(conn: sqlite3.Connection) -> bytes:
+def workbook_bytes(
+    conn: sqlite3.Connection, document_ids: Sequence[str] | None = None
+) -> bytes:
     """
-    The whole audit record as one spreadsheet, a sheet per table.
+    The audit record as one spreadsheet, a sheet per table.
 
     Sheet order follows how a reviewer works: the documents, what ingestion
     found in them, the extracted fields, what the run cost, then the analyses
     built on top and the assumptions behind them.
+
+    `document_ids` narrows every sheet to the chosen filings. Passing none
+    exports the whole database, which is rarely what a reader wants -- an
+    audit record for one transaction should not carry two others.
     """
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for table in TABLES:
-            frame = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            query, params = _scope(table, document_ids)
+            frame = pd.read_sql_query(query, conn, params=params)
             frame = frame.map(_truncate)
             # Excel caps a sheet name at 31 characters.
             frame.to_excel(writer, sheet_name=table[:31], index=False)
 
-        for name, frame in _derived_frames(conn).items():
+        for name, frame in _derived_frames(conn, document_ids).items():
             # Written even when empty, so the workbook has the same shape
             # every time. A missing sheet reads as "not produced"; a sheet
             # saying nothing was produced is a different, truer statement.

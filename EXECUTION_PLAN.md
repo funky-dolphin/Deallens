@@ -14,7 +14,8 @@ Build a Streamlit web application that ingests M&A transaction PDFs, extracts st
 - Layer segmentation: filing summary vs agreement exhibit vs governing documents
 - Transaction-structure classification (merger / tender offer / scheme …)
 - Page-integrity controls: duplicate, blank, sparse and unreadable pages;
-  printed-label reconciliation. Unreadable pages block extraction outright
+  printed-label reconciliation. An unreadable page blocks extraction of the
+  layer it sits in, not the whole document
 - Per-session in-memory SQLite database
 
 ### WS2 — LLM Extraction — complete
@@ -308,8 +309,8 @@ tests/                      216 tests
 
 ## Data flow
 
-One table is the hub. Extraction writes to `extracted_fields`; every section
-of the application reads from it. Nothing downstream re-reads the PDF, and no
+Extraction writes to `extracted_fields`. Every section of the application
+reads from `extracted_fields`. Nothing downstream re-reads the PDF, and no
 section filters by which layer a row came from.
 
 ```

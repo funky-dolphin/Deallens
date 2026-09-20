@@ -18,6 +18,7 @@ import html
 import json
 import os
 import uuid
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -359,6 +360,8 @@ with st.sidebar:
             "5 · Review queue",
             "6 · Hedging analysis",
             "7 · Q&A",
+            "8 · Export",
+            "9 · Technical memo",
         ],
     )
     st.divider()
@@ -621,30 +624,6 @@ elif page.startswith("2"):
                         for warning in run.warnings:
                             st.write(f"- {warning}")
 
-        st.divider()
-        st.subheader("Export the audit record")
-        st.caption(
-            "Everything in the database, one sheet per table, plus the "
-            "comparison, timeline and hedging analyses and the assumptions "
-            "behind them. Nothing is recomputed — the export reads the same "
-            "rows the application does, so it cannot disagree with what you "
-            "see on screen."
-        )
-        e1, e2 = st.columns(2)
-        e1.download_button(
-            "Download everything (Excel)",
-            data=workbook_bytes(conn),
-            file_name="deallens_audit_record.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
-        )
-        e2.download_button(
-            "Extracted fields, required schema (JSON)",
-            data=required_schema_json(conn, document_id),
-            file_name=f"{document_id}_extracted_fields.json",
-            mime="application/json",
-            width="stretch",
-        )
 
 
 # ── 3 · Summary vs. agreement ─────────────────────────────────────────────────
@@ -798,7 +777,9 @@ elif page.startswith("3"):
 
             st.download_button(
                 "Download comparison (JSON)",
-                data=json.dumps([c.to_dict() for c in comparisons], indent=2, default=str),
+                data=json.dumps(
+                    [c.to_dict() for c in comparisons], indent=2, default=str
+                ),
                 file_name=f"{document_id}_summary_vs_agreement.json",
                 mime="application/json",
             )
@@ -1275,3 +1256,146 @@ elif page.startswith("7"):
                     f"{answer.fields_used} asserted field(s) used as context · "
                     f"model `{answer.model_id}` · prompt `{PROMPT_VERSION}`"
                 )
+
+
+# ── 8 · Export ────────────────────────────────────────────────────────────────
+elif page.startswith("8"):
+    st.title("Export")
+    st.caption(
+        "Everything on this page is read from the database. Any document that "
+        "has been extracted can be exported at any time — no re-extraction, and "
+        "no need for the file to be loaded in this session."
+    )
+
+    documents = get_documents(conn)
+    if not documents:
+        st.info("Nothing to export yet. Start on **Ingest & inspect**.")
+    else:
+        st.subheader("What is in the database")
+        inventory = []
+        for doc in documents:
+            rows = get_extracted_fields(conn, doc["document_id"])
+            runs = list(
+                conn.execute(
+                    "SELECT layer_id, output_tokens FROM extraction_runs"
+                    " WHERE document_id = ?",
+                    (doc["document_id"],),
+                )
+            )
+            inventory.append(
+                {
+                    "document": doc["filename"],
+                    "structure": doc["transaction_structure"],
+                    "pages": doc["page_count"],
+                    "extracted fields": len(rows),
+                    "asserted": sum(1 for r in rows if r["status"] == "found"),
+                    "layers extracted": len(runs),
+                    "run": doc["run_id"],
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(inventory),
+            width="stretch",
+            hide_index=True,
+            height=_table_height(len(inventory)),
+        )
+
+        st.subheader("Per document")
+        st.caption(
+            "The assignment's required field-level shape: one record per "
+            "extracted field, with its value, currency, raw text, layer, page, "
+            "section, evidence quote, extraction method, confidence, review "
+            "status and run id."
+        )
+        for doc in documents:
+            rows = get_extracted_fields(conn, doc["document_id"])
+            if not rows:
+                st.caption(f"`{doc['filename']}` — not extracted yet.")
+                continue
+            payload = required_schema_json(conn, doc["document_id"])
+            c1, c2 = st.columns([2, 1])
+            c1.markdown(
+                f"**{doc['filename']}** — {len(rows)} fields, "
+                f"`{doc['transaction_structure']}`"
+            )
+            c2.download_button(
+                "Extracted fields (JSON)",
+                data=payload,
+                file_name=f"{doc['document_id']}_extracted_fields.json",
+                mime="application/json",
+                key=f"json-{doc['document_id']}",
+                width="stretch",
+            )
+
+        st.subheader("Full audit record")
+        st.caption(
+            "Every table as its own sheet, plus the summary-vs-agreement "
+            "comparison, the timeline and the hedging scenarios, and the "
+            "assumptions behind them. Nothing is recomputed differently here — "
+            "the export reads the same rows the application does, so it cannot "
+            "disagree with what is on screen."
+        )
+
+        by_name = {d["filename"]: d["document_id"] for d in documents}
+        chosen_names = st.multiselect(
+            "Documents to include",
+            list(by_name),
+            default=[documents[0]["filename"]],
+            help="An audit record for one transaction should not carry two others.",
+        )
+        chosen = [by_name[n] for n in chosen_names]
+
+        if not chosen:
+            st.info("Select at least one document.")
+        else:
+            # Rebuilt when the selection changes, and only on request: it
+            # reassembles the derived analyses, which is not something to do on
+            # every rerun of the page.
+            if st.session_state.get("workbook_scope") != chosen:
+                st.session_state.pop("workbook", None)
+
+            if st.button("Build the workbook", type="primary"):
+                with st.spinner("Assembling…"):
+                    st.session_state["workbook"] = workbook_bytes(conn, chosen)
+                    st.session_state["workbook_scope"] = chosen
+
+            if st.session_state.get("workbook"):
+                stem = (
+                    "deallens_audit_record"
+                    if len(chosen) > 1
+                    else chosen_names[0].rsplit(".", 1)[0].lower().replace(" ", "-")
+                )
+                st.download_button(
+                    "Download (Excel)",
+                    data=st.session_state["workbook"],
+                    file_name=f"{stem}_audit_record.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument"
+                        ".spreadsheetml.sheet"
+                    ),
+                )
+                st.caption(
+                    f"{len(st.session_state['workbook']) / 1e6:.2f} MB covering "
+                    f"{len(chosen)} document(s). The same files can be written "
+                    "from the command line with `scripts/export_outputs.py`."
+                )
+
+
+# ── 9 · Technical memo ────────────────────────────────────────────────────────
+elif page.startswith("9"):
+    # Rendered from TECHNICAL_MEMO.md rather than duplicated here. The memo is
+    # a submitted deliverable in its own right, and a copy in the page source
+    # would be a second version to keep in step with the first.
+    memo = Path(__file__).resolve().parent / "TECHNICAL_MEMO.md"
+    if not memo.exists():
+        st.error(f"`{memo.name}` is not in the repository.")
+    else:
+        text = memo.read_text()
+        st.markdown(text)
+        st.divider()
+        st.download_button(
+            "Download the memo (Markdown)",
+            data=text,
+            file_name=memo.name,
+            mime="text/markdown",
+        )
