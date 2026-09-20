@@ -98,9 +98,12 @@ Set no other configuration. In particular, **do not set `DEALLENS_DB`** on a
 hosted copy — that points every visitor at one shared file, so they would see
 each other's filings and each other's corrections.
 
-**Reviewers arrive to finished work.** A sample database is committed
-(`deallens_seed.db`) carrying three filings already read and extracted: two US
-mergers and a German takeover offer. Each visitor gets their own private copy
+**Reviewers arrive to finished work.** The filings themselves are not in the
+repository — they are public documents and large, the Uber one alone being
+4 MB. What is committed is `deallens_seed.db`: three filings already read and
+extracted, two US mergers and a German takeover offer. It holds every page's
+text as well as the extracted terms, so citations stay checkable without the
+original PDFs. Each visitor gets their own private copy
 of it, so there is something to look at immediately and nobody has to spend
 money to see how it works.
 
@@ -165,6 +168,10 @@ All five are also downloadable as PDFs from the Export page.
 the model is replaced by a stand-in, and test documents are generated rather
 than downloaded. A captured run is in `TEST_RESULTS.txt`.
 
+On a fresh clone you will see **234 pass and 23 skip**. The skipped ones check
+behaviour against a real filing, which is not committed (see below); each skip
+names the file and where to download it.
+
 ---
 
 ## Layout
@@ -186,6 +193,8 @@ scripts/                pricing a run, exporting outputs
 tests/                  257 tests
 outputs/                extracted data for the three sample filings
 deallens_seed.db        those three filings, ready to open in the app
+                        (the source PDFs are not committed; links are in
+                         the assignment and in the skip messages)
 ```
 
 ---

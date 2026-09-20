@@ -13,3 +13,10 @@ __pycache__/
 !deallens_seed.db
 .venv/
 .pytest_cache/
+
+# Source filings are not committed. They are public documents, linked from the
+# assignment and from README.md, and they are large -- the Uber filing alone is
+# 4 MB. Everything extracted from them, including each page's text, is in
+# deallens_seed.db, so citations stay verifiable without the originals.
+*.pdf
+!DealLens_Core_Case_Study_Editable.pdf
