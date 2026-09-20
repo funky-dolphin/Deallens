@@ -65,6 +65,7 @@ from deallens.extraction import (
     extract_document,
 )
 from deallens.ingestion import ingest
+from deallens.pdf import markdown_to_pdf
 from deallens.qa import PRESET_QUESTIONS, answer_question
 from deallens.review import LAYER_CONFLICT, apply_correction, review_items
 from deallens.timeline import build_timeline
@@ -1324,6 +1325,40 @@ elif page.startswith("8"):
                 file_name=f"{doc['document_id']}_extracted_fields.json",
                 mime="application/json",
                 key=f"json-{doc['document_id']}",
+                width="stretch",
+            )
+
+        st.subheader("Project documents")
+        st.caption(
+            "The written deliverables, rendered as PDFs. They are kept in the "
+            "repository as Markdown so version control can read them, and "
+            "typeset on download so a reviewer does not have to."
+        )
+        DOCUMENTS = (
+            ("TECHNICAL_MEMO.md", "Technical memo", "the three-page summary"),
+            ("DECISION_RECORDS.md", "Agent decision records",
+             "nine records, including what the agent got wrong"),
+            ("AGENT_WORKFLOW.md", "Agent workflow",
+             "how it was built, tests, leverage, what to do differently"),
+            ("WS7_GENERALIZATION.md", "Generalization analysis",
+             "the three filings compared"),
+            ("EXECUTION_PLAN.md", "Execution plan",
+             "workstreams, schema, data flow, testing"),
+        )
+        root = Path(__file__).resolve().parent
+        for filename, label, blurb in DOCUMENTS:
+            path = root / filename
+            c1, c2 = st.columns([2, 1])
+            if not path.exists():
+                c1.caption(f"**{label}** — `{filename}` is not in the repository.")
+                continue
+            c1.markdown(f"**{label}** — {blurb}")
+            c2.download_button(
+                "Download PDF",
+                data=markdown_to_pdf(path.read_text(), title=label),
+                file_name=f"{path.stem.lower()}.pdf",
+                mime="application/pdf",
+                key=f"pdf-{filename}",
                 width="stretch",
             )
 

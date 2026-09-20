@@ -194,6 +194,140 @@ ones.
 
 ---
 
+---
+
+## Representative instructions and project context supplied
+
+The assignment PDF was the source of truth throughout, read directly rather
+than summarised, and re-read before each workstream. Standing context given at
+the outset and restated when it slipped: fail closed rather than guess, cite
+everything, never merge the document layers, and treat the filing as untrusted
+input.
+
+Instructions were mostly short and corrective rather than long and
+specifying. A representative sample, verbatim:
+
+> "Why isn't anything being posted to the extracted_fields table? Is that
+> intended?"
+
+> "I actually think we leave it and make a note of it. I think that if we can
+> extract data from 147/148 pages is really good. And we have a case to make
+> about whats next to come for this application."
+
+> "Dont over complicate this. I just wanted the option to select other claude
+> models!"
+
+> "I feel like there a lot of things are marked as conflicting when they kinda
+> say the same thing?"
+
+> "Wait why are we calling the one table that we write to 'the hub'. Please
+> just use the actual name of the table."
+
+> "are we able to extract text from them?"
+
+Two patterns in that sample did most of the work. **Questions rather than
+instructions** — "is that intended?", "are we able to?" — consistently
+surfaced defects, because they forced the answer to be checked rather than
+asserted. And **naming the symptom without prescribing the fix** left room for
+the diagnosis to be wrong, which it sometimes was: the "conflicts" observation
+turned out to be a false-positive rate, not a bug in the conflict logic.
+
+---
+
+## Tests and validation loops
+
+242 tests, no network and no API key required, running in about 40 seconds.
+Captured output in `TEST_RESULTS.txt`; the strategy and per-file breakdown are
+in `EXECUTION_PLAN.md`.
+
+The loop that mattered was narrow: **state the behaviour as a test before
+implementing, run the suite after every change, and treat a failure as
+information rather than an obstacle.** Three times a failing test was right
+and the design was wrong:
+
+- A test asserting `"$250 million"` and `"$250,000,000"` should be a
+  *normalized match* failed, because the comparison was checking normalized
+  values — where both are the same float. The distinction had to move onto the
+  source text.
+- A test asserting `"Bio-Techne"` against `"Bio-Techne Corporation"` was a
+  conflict passed, then had to be **reversed** once real output showed it was
+  the summary using a short form, not two companies.
+- A demo of the WS5 grid showed the outcome probabilities summing to 1.10,
+  because the single supplied delayed-close probability was being applied to
+  both delay scenarios.
+
+Validation beyond the suite came from three sources: probing the live API for
+behaviour that could not be reasoned about, measuring figures rather than
+estimating them (`count_tokens` for the cost baseline), and running the
+pipeline end to end on documents it had never seen.
+
+---
+
+## Approximate time spent
+
+**Roughly 20 hours across three sessions**, against the assignment's estimate
+of 8–12. The first session built ingestion and extraction; the second built
+the timeline, hedging, Q&A and review; the third was generalization, exports
+and documentation.
+
+The overrun went almost entirely into three things: the fail-closed controls
+and the tests holding them down, correcting claims in the documentation that
+had become false, and the defects found by running against unseen documents.
+None of it went into the happy path, which was working early.
+
+---
+
+## Estimated net agent leverage
+
+**High on volume, mixed on judgement, and the mix is the interesting part.**
+
+24 modules and 8,856 lines of Python with 242 tests, written in about 20
+hours. That volume is not achievable by hand in the time, and the tests in
+particular — which are the reason the defects below were catchable — would
+have been the first thing cut under time pressure.
+
+Against that, the agent's unsupervised judgement was wrong often enough to
+matter, and in ways that would not have announced themselves:
+
+- It over-built a model selector into profiles, a CLI flag and six tests when
+  a dropdown was asked for, and had to be told twice to cut it back.
+- It wrote a whitelist of extractable layers that was correct for one document
+  and silently wrong for another.
+- It dropped cache-creation tokens from the audit record, making every run
+  under-report its own cost.
+- It invented a duration — "eighteen months" — in a document about rigour.
+
+Every one of those was caught by a human asking a direct question, or by a
+test, or by checking a number against the system that produced it. The honest
+summary is that the leverage is real but conditional: it multiplies output,
+and it multiplies the cost of not reading that output. The controls in this
+codebase exist because the same failure mode — a confident answer that is
+wrong and does not look wrong — applies to the agent writing it as much as to
+the model extracting from a filing.
+
+---
+
+## Improvements in a second iteration
+
+1. **Write the documentation last, or regenerate it.** Design documents
+   written alongside the code accumulated claims that were true when written
+   and false later — a table that never existed, a decision that had been
+   reversed, a status vocabulary that had changed. Six such errors were found
+   and corrected. Anything derived from code should be generated from it.
+2. **Run against an unseen document much earlier.** Every significant
+   generalization defect surfaced within an hour of the first validation
+   filing. Held back, they all looked like design decisions.
+3. **Measure before optimising the prompt.** The schema shape was rebuilt
+   because of an API limit discovered by hitting it; probing first would have
+   been cheaper than debugging after.
+4. **Treat display formatting as part of the deliverable.** Page numbers
+   rendering as `3.0000`, money as `14200000000.0` and a status reading
+   `blocked` for a document that extracts fine were all noticed by a reader,
+   not by a test.
+5. **Decide the review model before building the queue.** Manual correction
+   arrived late; marking a field verified had until then left its value null,
+   so a reviewer's judgement was recorded and then ignored downstream.
+
 ## Known Gaps / TODO
 
 - [x] WS3: Filing summary vs agreement comparison, on the **Summary vs.
