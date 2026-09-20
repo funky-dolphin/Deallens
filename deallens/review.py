@@ -36,7 +36,7 @@ import json
 import sqlite3
 from dataclasses import dataclass, field as dataclass_field
 
-from .db.repository import get_page_text
+from .db.repository import get_extracted_fields, get_page_text, get_review_queue
 from .extraction import models
 from .extraction import normalize as norm
 from .extraction.registry import BY_NAME
@@ -44,6 +44,86 @@ from .ingestion.locators import SourceLocator, compute_anchor, verify_evidence
 
 MANUAL = "manual"
 HYBRID = "hybrid"
+
+# Why a field is in front of a reviewer.
+CONTROL_EXCEPTION = "control_exception"
+LAYER_CONFLICT = "layer_conflict"
+
+
+def review_items(conn: sqlite3.Connection, document_id: str) -> list[dict]:
+    """
+    Everything a reviewer has to adjudicate, from both sources.
+
+    A field reaches review two ways, and querying only one of them leaves the
+    other invisible:
+
+      `control_exception`  A control withheld the value -- ambiguous
+                           normalization, an evidence quote absent from the
+                           cited page, confidence below the bar. This is
+                           recorded on the row as `review_status='exception'`.
+
+      `layer_conflict`     The filing summary and the agreement each produced
+                           a clean value and the values disagree. Both rows
+                           passed every control on their own, so neither is an
+                           exception; the problem exists only between them.
+                           Workstream 3 computes this on demand and does not
+                           write it back, so a query on `review_status` alone
+                           never sees it -- and the assignment requires a
+                           conflict be routed to review.
+
+    Each returned row carries `review_reason` and, for a conflict, the other
+    layer's value in `conflict_with`.
+    """
+    from .comparison import CONFLICT, compare_layers
+
+    rows = get_extracted_fields(conn, document_id)
+    by_id = {row["id"]: row for row in rows}
+
+    items: dict[int, dict] = {}
+    for row in get_review_queue(conn, document_id):
+        item = dict(by_id.get(row["id"], row))
+        item["review_reason"] = CONTROL_EXCEPTION
+        item["conflict_with"] = None
+        items[row["id"]] = item
+
+    for comparison in compare_layers(rows):
+        if comparison.classification != CONFLICT:
+            continue
+        for reading, other in (
+            (comparison.summary, comparison.agreement),
+            (comparison.agreement, comparison.summary),
+        ):
+            match = next(
+                (
+                    row
+                    for row in rows
+                    if row["field_name"] == comparison.field_name
+                    and row["document_layer"] == reading.layer
+                ),
+                None,
+            )
+            if match is None or match["review_status"] == models.VERIFIED:
+                continue
+            item = items.setdefault(match["id"], dict(match))
+            # A row can be both: withheld by a control *and* in conflict. The
+            # conflict is the more actionable of the two, so it wins the label.
+            item["review_reason"] = LAYER_CONFLICT
+            item["conflict_with"] = {
+                "layer": other.layer,
+                "value": other.normalized_value,
+                "page": other.page,
+                "evidence": other.evidence,
+            }
+
+    return sorted(
+        items.values(),
+        key=lambda row: (
+            not row["is_critical"],
+            0 if row["review_reason"] == LAYER_CONFLICT else 1,
+            row["field_name"],
+            row["document_layer"] or "",
+        ),
+    )
 
 
 @dataclass

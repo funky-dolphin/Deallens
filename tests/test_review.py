@@ -248,3 +248,125 @@ def test_the_locator_follows_a_corrected_page(conn_with_extraction):
 def test_an_unknown_row_is_refused(conn_with_extraction):
     conn, _ = conn_with_extraction
     assert not apply_correction(conn, 999_999, "$1").accepted
+
+
+# ---------------------------------------------------------------------------
+# What actually reaches a reviewer
+# ---------------------------------------------------------------------------
+
+def _conflicting_db():
+    """Two layers that each read cleanly and disagree with each other."""
+    from deallens.db import get_connection, initialize_schema
+    from deallens.extraction.models import ExtractedField
+    from deallens.extraction.extractor import ExtractionRun
+    from deallens.ingestion import ingest
+
+    pdf = make_pdf(
+        [sec_cover_page(), "Item 1.01 Entry into a Material Definitive Agreement.",
+         exhibit_cover("2.1", "AGREEMENT AND PLAN OF MERGER")]
+        + agreement_pages(body_pages=3)
+    )
+    conn = initialize_schema(get_connection())
+    ingestion = ingest(pdf, "filing.pdf", run_id="conflict-test")
+    save_ingestion(conn, ingestion)
+
+    def _f(layer, value, raw, status=models.FOUND, review=models.UNREVIEWED):
+        return ExtractedField(
+            field_name="company_termination_fee",
+            document_id=ingestion.document_id, run_id=ingestion.run_id,
+            document_layer=layer, normalized_value=value, raw_value=raw,
+            evidence="a quote", pdf_page=4, printed_page="A-4",
+            confidence=0.96, status=status, review_status=review,
+            evidence_verified=True, extraction_method="llm",
+        )
+
+    run = ExtractionRun(
+        document_id=ingestion.document_id, run_id=ingestion.run_id,
+        model_id="claude-opus-5", prompt_version="3.0.0",
+        fields=[
+            # Both clean, both verified, different values.
+            _f("filing-summary", 250_000_000.0, "$250,000,000"),
+            _f("agreement-ex2.1", 255_000_000.0, "$255,000,000"),
+        ],
+    )
+    save_extraction(conn, run)
+    return conn, ingestion.document_id
+
+
+def test_a_cross_layer_conflict_reaches_the_reviewer():
+    """
+    Both rows passed every control on their own, so neither is an exception.
+    The disagreement exists only between them, and a query on review_status
+    alone never sees it.
+    """
+    from deallens.review import LAYER_CONFLICT, review_items
+
+    conn, document_id = _conflicting_db()
+    try:
+        assert get_review_queue(conn, document_id) == [], "no row is an exception"
+
+        items = review_items(conn, document_id)
+        assert len(items) == 2
+        assert all(i["review_reason"] == LAYER_CONFLICT for i in items)
+        assert {i["document_layer"] for i in items} == {
+            "filing-summary", "agreement-ex2.1"
+        }
+    finally:
+        conn.close()
+
+
+def test_a_conflict_item_carries_the_opposing_reading():
+    """A reviewer adjudicating a disagreement needs to see both sides."""
+    from deallens.review import review_items
+
+    conn, document_id = _conflicting_db()
+    try:
+        summary = next(
+            i for i in review_items(conn, document_id)
+            if i["document_layer"] == "filing-summary"
+        )
+        other = summary["conflict_with"]
+        assert other["layer"] == "agreement-ex2.1"
+        assert other["value"] == 255_000_000.0
+        assert other["page"] == "A-4"
+        assert other["evidence"]
+    finally:
+        conn.close()
+
+
+def test_correcting_one_side_of_a_conflict_removes_it_from_review():
+    from deallens.review import apply_correction, review_items
+
+    conn, document_id = _conflicting_db()
+    try:
+        items = review_items(conn, document_id)
+        summary = next(i for i in items if i["document_layer"] == "filing-summary")
+        apply_correction(conn, summary["id"], "$255,000,000", evidence="a quote", pdf_page=4)
+
+        remaining = {i["id"] for i in review_items(conn, document_id)}
+        assert summary["id"] not in remaining, "a verified row is settled"
+    finally:
+        conn.close()
+
+
+def test_a_field_neither_layer_mentions_is_not_put_in_front_of_a_reviewer():
+    """
+    The comparison calls it unresolved, but there is nothing to adjudicate.
+    Queuing it is how a review queue stops being read.
+    """
+    from deallens.comparison import LayerReading, compare_field
+
+    silent = compare_field(
+        "bridge_amount",
+        LayerReading(layer="filing-summary", status=models.NOT_FOUND),
+        LayerReading(layer="agreement", status=models.NOT_FOUND),
+    )
+    withheld = compare_field(
+        "outside_date",
+        LayerReading(layer="filing-summary", status=models.UNRESOLVED,
+                     raw_value="the second half of 2026"),
+        LayerReading(layer="agreement", status=models.NOT_FOUND),
+    )
+
+    assert not silent.needs_review
+    assert withheld.needs_review

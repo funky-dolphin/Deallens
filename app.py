@@ -29,6 +29,7 @@ from deallens.analytics.hedging import (
     BIO_TECHNE_ASSUMPTIONS,
     RISK_FACTORS,
     RISK_LABELS,
+    STRATEGIES,
     deal_from_rows,
     probability_weighted,
     risk_exposures,
@@ -62,7 +63,7 @@ from deallens.extraction import (
 )
 from deallens.ingestion import ingest
 from deallens.qa import PRESET_QUESTIONS, answer_question
-from deallens.review import apply_correction
+from deallens.review import LAYER_CONFLICT, apply_correction, review_items
 from deallens.timeline import build_timeline
 
 load_dotenv()
@@ -128,7 +129,7 @@ st.markdown(
         border-top: 3px solid {RED};
       }}
       section[data-testid="stSidebar"] h1 {{
-        font-size: 1.05rem; letter-spacing: 0.06em; text-transform: uppercase;
+        font-size: 1.05rem; letter-spacing: 0.01em;
         color: {NAVY};
         background-image: linear-gradient(90deg, {RED} 0 1.6rem, {NAVY} 1.6rem);
         background-size: 100% 2px;
@@ -248,6 +249,18 @@ def _red_if_negative(value) -> str:
     does appear in a figure it carries information rather than decoration.
     """
     return f"color: {RED}" if isinstance(value, (int, float)) and value < 0 else ""
+
+
+def _table_height(row_count: int) -> int:
+    """
+    Height that fits a small table exactly.
+
+    Left to size itself, `st.dataframe` opens an internal scroll region. A
+    page with seven of them stacked catches the wheel on each one on the way
+    down, which reads as the page fighting you. Sizing them to their contents
+    removes the inner scrollbar and lets the page scroll as one.
+    """
+    return 35 * row_count + 40
 
 
 def _page_cell(value) -> str:
@@ -777,16 +790,23 @@ elif page.startswith("4"):
 elif page.startswith("5"):
     st.title("Review queue")
     st.caption(
-        "Fields the pipeline declined to assert: below the confidence threshold, "
-        "unverifiable evidence, ambiguous normalization, or conflicting readings "
-        "across layers. Critical fields first."
+        "Two things reach a reviewer: a value a control withheld, and a value "
+        "the filing summary and the agreement both reported cleanly and "
+        "differently. The second passes every control on each row on its own, "
+        "so it is found by comparing them. Critical fields and conflicts first."
     )
 
     document_id = _doc_picker()
     if document_id:
-        queue = get_review_queue(conn, document_id)
+        queue = review_items(conn, document_id)
         if not queue:
             st.success("Nothing awaiting review for this document.")
+        else:
+            conflicts = sum(1 for r in queue if r["review_reason"] == LAYER_CONFLICT)
+            st.caption(
+                f"{len(queue)} item(s): {conflicts} where the two layers disagree, "
+                f"{len(queue) - conflicts} where a control withheld the value."
+            )
         for row in queue:
             mark = "CRITICAL" if row["is_critical"] else "standard"
             with st.expander(f"{mark} **{row['field_name']}** — {row['status']}"):
@@ -797,6 +817,23 @@ elif page.startswith("5"):
                         "materially worse than an honest absence.",
                         unsafe_allow_html=True,
                     )
+                if row["review_reason"] == LAYER_CONFLICT and row["conflict_with"]:
+                    other = row["conflict_with"]
+                    st.markdown(
+                        "<span class='deallens-flag'>LAYERS DISAGREE</span> — both "
+                        "readings passed their controls; they do not agree with "
+                        "each other.",
+                        unsafe_allow_html=True,
+                    )
+                    st.write(
+                        f"**This layer** (`{row['document_layer']}`): "
+                        f"{row['normalized_value']}  \n"
+                        f"**Other layer** (`{other['layer']}`): {other['value']} "
+                        f"— page {_page_cell(other['page'])}"
+                    )
+                    if other["evidence"]:
+                        st.caption(f"other layer's evidence: “{other['evidence']}”")
+
                 st.write(f"**Raw value:** {row['raw_value'] or '—'}")
                 st.write(f"**Normalized:** {row['normalized_value'] or '—'}")
                 st.write(
@@ -934,6 +971,7 @@ elif page.startswith("6"):
             ),
             width="stretch",
             hide_index=True,
+            height=_table_height(len(ADDITIONAL_ASSUMPTIONS)),
         )
 
     st.caption(
@@ -942,9 +980,27 @@ elif page.startswith("6"):
         "is the change against the base case."
     )
 
+    # Results are held in session state rather than rendered inside the
+    # button's own run. A Streamlit button is True only on the rerun that
+    # follows the click, so anything built inside it disappears the moment the
+    # user touches another widget -- the page collapses from seven tables back
+    # to a header, which reads as the page jumping rather than as state being
+    # lost. They are cleared when the document changes, because the delay
+    # scenarios are dated from that document's timeline.
+    if st.session_state.get("hedging_document") != document_id:
+        st.session_state.pop("hedging_results", None)
+        st.session_state["hedging_document"] = document_id
+
     if st.button("Run scenarios", type="primary"):
         deal = deal_from_rows(rows) if document_id and rows else None
-        results = run_scenarios(horizon=horizon, deal=deal)
+        st.session_state["hedging_results"] = run_scenarios(
+            horizon=horizon, deal=deal
+        )
+        st.session_state["hedging_deal"] = deal
+
+    results = st.session_state.get("hedging_results")
+    if results:
+        deal = st.session_state.get("hedging_deal")
         frame = pd.DataFrame([r.to_dict() for r in results])
 
         st.subheader("Scenario results")
@@ -978,6 +1034,7 @@ elif page.startswith("6"):
                 table.style.format(money).map(_red_if_negative),
                 width="stretch",
                 hide_index=True,
+                height=_table_height(len(table)),
             )
             for note in dict.fromkeys(n for r in rows_for for n in r.notes):
                 st.caption(f"· {note}")
@@ -995,6 +1052,7 @@ elif page.startswith("6"):
             ),
             width="stretch",
             hide_index=True,
+            height=_table_height(len(STRATEGIES)),
         )
 
         st.subheader("Probability-weighted outcome")

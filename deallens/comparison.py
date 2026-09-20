@@ -119,7 +119,19 @@ class FieldComparison:
 
     @property
     def needs_review(self) -> bool:
-        return self.classification in {CONFLICT, UNRESOLVED}
+        """
+        Whether a person has something to do about this field.
+
+        A conflict always does. An `unresolved` only does when a value was
+        actually read and then withheld -- when neither layer mentions the
+        field there is nothing to adjudicate, and putting it in front of a
+        reviewer is how a queue stops being read.
+        """
+        if self.classification == CONFLICT:
+            return True
+        if self.classification == UNRESOLVED:
+            return self.summary.was_attempted or self.agreement.was_attempted
+        return False
 
     @property
     def preferred_page(self) -> object | None:
