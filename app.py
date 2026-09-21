@@ -426,7 +426,19 @@ if page.startswith("1"):
     if uploaded:
         pdf_bytes, filename = uploaded.read(), uploaded.name
 
-    source_url = st.text_input("Source URL (optional)", placeholder="https://www.sec.gov/...")
+    source_url = st.text_input(
+        "Source URL (optional)",
+        placeholder="https://www.sec.gov/...",
+        help=(
+            "Recorded against the document and carried into the export, so a "
+            "reviewer checking a cited page can find the public filing it came "
+            "from. It is not validated."
+        ),
+    )
+    st.caption(
+        "Saved with the document as a reference. The filing is not downloaded "
+        "from this address — upload the PDF above."
+    )
 
     if pdf_bytes and st.button("Ingest document", type="primary"):
         run_id = f"ui-{uuid.uuid4().hex[:8]}"
