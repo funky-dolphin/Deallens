@@ -35,6 +35,7 @@ from deallens.analytics.hedging import (
     STRATEGIES,
     deal_from_rows,
     probability_weighted,
+    resolve_financing,
     risk_exposures,
     run_scenarios,
 )
@@ -1163,7 +1164,48 @@ elif page.startswith("6"):
     results = st.session_state.get("hedging_results")
     if results:
         deal = st.session_state.get("hedging_deal")
+        source_rows = st.session_state.get("hedging_rows")
+        inputs = resolve_financing(BIO_TECHNE_ASSUMPTIONS, source_rows)
         frame = pd.DataFrame([r.to_dict() for r in results])
+
+        st.subheader("What this run is pricing")
+        st.caption(
+            "Where the filing states a figure it is used and marked "
+            "`extracted`. Where it does not, the assignment's standardized "
+            "input is used and marked `assumed`. DV01 is `derived` — the "
+            "supplied per-100mm sensitivity scaled by notional and tenor."
+        )
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "input": r["input"],
+                        "value": (
+                            f"{r['value']:,.2f}"
+                            if isinstance(r["value"], (int, float))
+                            and not isinstance(r["value"], bool)
+                            else r["value"]
+                        ),
+                        "source": r["source"],
+                        "basis": r["basis"],
+                    }
+                    for r in inputs.to_rows()
+                ]
+            ),
+            width="stretch",
+            hide_index=True,
+            height=_table_height(5),
+        )
+        if inputs.extracted:
+            st.caption(
+                f"Taken from the filing: **{', '.join(inputs.extracted)}**. "
+                f"All figures below are in **{inputs.currency.value}**."
+            )
+        else:
+            st.caption(
+                "Nothing in this filing supplied a financing figure, so the run "
+                "uses the standardized assumptions throughout."
+            )
 
         st.subheader("Scenario results")
         st.caption(
@@ -1209,7 +1251,7 @@ elif page.startswith("6"):
             "still a risk it carries."
         )
         st.dataframe(
-            pd.DataFrame(risk_exposures(deal=deal)).rename(
+            pd.DataFrame(risk_exposures(deal=deal, rows=source_rows)).rename(
                 columns={f: RISK_LABELS[f] for f in RISK_FACTORS}
             ),
             width="stretch",

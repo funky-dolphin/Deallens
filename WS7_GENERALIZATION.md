@@ -54,9 +54,9 @@ mergers report no acceptance threshold. Four fields flip between structures;
 the other 46 apply to all of them.
 
 **Currency handling.** `consideration_currency` resolved `USD`, `USD`, `EUR`
-without configuration, and the EUR reading flows through to the FX exposure
-in the hedging analytics, which reports the German deal as FX-exposed and the
-two US deals as not.
+without configuration. The euro reading now drives both the FX exposure and
+the currency the hedging figures are reported in, so the German deal is
+analysed in euro rather than silently treated as dollars (see §3).
 
 **Layer segmentation and citation.** Every filing segmented into its
 constituent instruments, and every asserted value carries a layer, a page and
@@ -70,7 +70,10 @@ the input proportional to the layers worth reading rather than to the file.
 
 ## 3. What required a schema extension
 
-**One, and it was a real one: financing agreements attached as exhibits.**
+Two, and both were found by the validation filings rather than by review.
+Neither fix is specific to the deal that exposed it.
+
+**Schema extension #1: financing agreements attached as exhibits (applied).**
 
 The German filing attaches its bridge facility as Exhibit 10.1 — a
 `BRIDGE CREDIT AGREEMENT`, 84 pages, Morgan Stanley Senior Funding as
@@ -110,6 +113,51 @@ The German deal went from having no source for its bridge terms to asserting
 `bridge_maturity` (364 days after the Closing Date) and `interest_basis`
 (EURIBOR plus an applicable margin). The two US filings are unchanged —
 neither attaches a financing agreement.
+
+**Schema extension #2: the analytics were not adapting to the deal (applied).**
+Found by a reviewer noticing that changing the selected document left every
+hedging figure unchanged.
+
+It was not a display fault. The analysis took its notional, tenor, currency
+and rate basis entirely from the assignment's standardized financing block, so
+it priced a **USD 4bn seven-year fixed-rate issuance for all three filings** —
+including one whose disclosed facility is **EUR 14.2bn over 364 days**, with
+every one of those facts already extracted and sitting in `extracted_fields`.
+
+The assignment is explicit: *"For the validation transactions, adapt the
+analytics to the extracted transaction characteristics. If data are
+unavailable, use clearly labeled synthetic assumptions."* The build was always
+taking the second branch.
+
+`resolve_financing` now prefers the filing and falls back to the assumption,
+marking each input `extracted`, `assumed` or `derived`:
+
+| Input | Development | Validation 1 | Validation 2 |
+|---|---|---|---|
+| Notional | 4,000,000,000 *assumed* | 4,000,000,000 *assumed* | **11,500,000,000 extracted** |
+| Currency | USD *extracted* | USD *extracted* | **EUR extracted** |
+| Tenor (years) | 7 *assumed* | 7 *assumed* | **0.997 extracted** |
+| Rate basis | swap rate *assumed* | swap rate *assumed* | **EURIBOR + margin extracted** |
+| DV01 *derived* | 2,600,000 | 2,600,000 | **1,064,654** |
+
+The effect on the headline figures:
+
+| Rates +25bp, unhedged | Development | Validation 1 | Validation 2 |
+|---|---|---|---|
+| Before | −65,000,000 | −65,000,000 | −65,000,000 |
+| After | −65,000,000 USD | −65,000,000 USD | **−26,616,339 EUR** |
+
+Two things worth stating about the result. The notional used is the
+**agreement's** 11.5bn rather than the summary's 14.2bn, because the source
+hierarchy says the executed contract governs — so the analysis and the
+press-facing number differ, deliberately. And DV01 is scaled linearly by
+tenor, a first-order duration approximation: crude, labelled `derived` with
+its arithmetic, and far closer than ignoring tenor, which overstated a
+364-day facility's rate sensitivity roughly sevenfold.
+
+The two US mergers still price identically to each other. That is correct —
+neither states a facility, so both fall back to the one supplied financing
+block.
 
 ---
 
@@ -218,6 +266,7 @@ differently; see §7.
 | Asserted, Timing | 5 | 4 | 5 |
 | Dated timeline entries | 2 | 2 | 1 |
 | Hedge horizon complete | yes (273 days) | yes (275 days) | **no** |
+| Financing inputs taken from the filing | 1 of 4 | 1 of 4 | **4 of 4** |
 
 Counts are out of 96 — 48 applicable fields across two compared layers.
 
@@ -272,18 +321,26 @@ control that ignores which layers a run touches will refuse work it has no
 bearing on. Validation 2 was initially refused in full over one slide in an
 investor deck.
 
-**6. Treat narrative and typed fields differently in comparison.** Also
+**6. Adapt the analytics to the extracted deal.** Applied during this
+workstream, and the pattern generalises past this one case: a synthetic input
+should be a fallback, not a default. Anything the filing states should be
+used and labelled as extracted, so a reader can see which figures rest on the
+document and which on an assumption. The remaining assumed inputs — the rate
+levels, the probabilities, the DV01 per 100mm — are genuinely not in a filing,
+which is why they stay assumed.
+
+**7. Treat narrative and typed fields differently in comparison.** Also
 applied during this workstream. Typed values normalize to canonical forms
 where a difference is a disagreement; narrative values are expected to differ
 between a summary and the contract it summarises. Comparing both the same way
 produced a nine-to-one false positive rate.
 
-**7. Add OCR or a vision fallback for `image_only` pages.** Not needed for
+**8. Add OCR or a vision fallback for `image_only` pages.** Not needed for
 these three, where the single affected page is in a layer never read, but it
 is the only remaining path to a genuinely complete read of an arbitrary
 filing.
 
-**8. Re-measure classification confidence against more filings.** A 0.73 on
+**9. Re-measure classification confidence against more filings.** A 0.73 on
 an ordinary US merger suggests the scoring is tuned narrowly. With only three
 documents there is no basis for setting a rejection threshold.
 
@@ -301,3 +358,10 @@ documents there is no basis for setting a rejection threshold.
   the two identified.
 - **Extension-clause parsing is unexercised**, so the calculated-date path in
   Workstream 4 has no real-document evidence behind it.
+- **FX exposure is identified but still not priced.** The euro deal is now
+  analysed in euro, on a euro notional, rather than being silently treated as
+  dollars — but no FX rate or volatility is supplied, so the FX column remains
+  an exposure rather than a number.
+- **Tenor is read, duration is approximated.** DV01 scales linearly with the
+  stated maturity against the supplied seven-year figure. Right order of
+  magnitude, not a curve.

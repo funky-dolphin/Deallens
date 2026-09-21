@@ -39,6 +39,7 @@ nothing.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -167,6 +168,10 @@ class ScenarioResult:
     probability: float | None = None
     delay_days: int | None = None
     delayed_to: str | None = None
+    # Figures are in the deal's own currency. No FX rate is supplied, so a
+    # EUR facility is reported in EUR rather than converted at an invented one.
+    currency: str = "USD"
+    extracted_inputs: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     assumptions_version: str = ASSUMPTIONS_VERSION
 
@@ -182,6 +187,8 @@ class ScenarioResult:
             "probability": self.probability,
             "delay_days": self.delay_days,
             "delayed_to": self.delayed_to,
+            "currency": self.currency,
+            "extracted_inputs": ", ".join(self.extracted_inputs),
             "net_pnl": self.net_pnl,
             "assumptions_version": self.assumptions_version,
             "notes": list(self.notes),
@@ -254,6 +261,195 @@ def deal_from_rows(rows: list[dict]) -> DealCharacteristics:
         bridge_currency=values.get("bridge_currency"),
         bridge_amount=values.get("bridge_amount"),
     )
+
+
+# Where an input came from. The assignment requires source facts, synthetic
+# assumptions and calculations be distinguishable, and for these analytics
+# that distinction is per input rather than per figure: a run can price an
+# extracted notional against an assumed rate curve.
+EXTRACTED = "extracted"
+ASSUMED = "assumed"
+DERIVED = "derived"
+
+
+@dataclass(frozen=True)
+class Input:
+    """One analytic input, and where it came from."""
+
+    value: object
+    source: str
+    basis: str
+
+    @property
+    def is_extracted(self) -> bool:
+        return self.source == EXTRACTED
+
+
+@dataclass(frozen=True)
+class FinancingInputs:
+    """
+    What the analysis is actually pricing.
+
+    The assignment supplies a standardized financing block, and requires that
+    for the validation transactions the analytics be adapted to the extracted
+    transaction characteristics. So these are resolved per document: where the
+    filing states a figure it is used and marked `extracted`, and where it
+    does not the supplied assumption is used and marked `assumed`.
+
+    Without this the analysis priced a USD 4bn seven-year fixed-rate issuance
+    for every deal, including one whose disclosed facility is EUR 14.2bn over
+    364 days -- with all four of those facts sitting extracted in the database.
+    """
+
+    notional: Input
+    currency: Input
+    tenor_years: Input
+    rate_basis: Input
+    dv01: Input
+
+    @property
+    def extracted(self) -> list[str]:
+        return [
+            name
+            for name, field in (
+                ("notional", self.notional),
+                ("currency", self.currency),
+                ("tenor", self.tenor_years),
+                ("rate basis", self.rate_basis),
+            )
+            if field.is_extracted
+        ]
+
+    def to_rows(self) -> list[dict]:
+        """Flat shape for display and export."""
+        return [
+            {"input": name, "value": field.value, "source": field.source,
+             "basis": field.basis}
+            for name, field in (
+                ("Notional", self.notional),
+                ("Currency", self.currency),
+                ("Tenor (years)", self.tenor_years),
+                ("Rate basis", self.rate_basis),
+                ("DV01", self.dv01),
+            )
+        ]
+
+
+_TENOR_RE = re.compile(
+    r"(\d[\d,.]*)\s*[-\s]*(day|week|month|year)s?", re.I
+)
+_TENOR_YEARS = {"day": 1 / 365.0, "week": 7 / 365.0, "month": 1 / 12.0, "year": 1.0}
+
+
+def parse_tenor_years(text: str | None) -> float | None:
+    """
+    Read a stated maturity as a number of years.
+
+    "364 days after the Closing Date" is just under a year, and a facility of
+    that length carries roughly a seventh of the interest-rate duration of the
+    seven-year issuance the assumptions describe. Reading it matters more than
+    it looks.
+    """
+    if not text:
+        return None
+    match = _TENOR_RE.search(str(text))
+    if not match:
+        return None
+    try:
+        amount = float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    if amount <= 0:
+        return None
+    return amount * _TENOR_YEARS[match.group(2).lower()]
+
+
+def resolve_financing(
+    assumptions: dict, rows: list[dict] | None = None
+) -> FinancingInputs:
+    """
+    Decide what this run prices, preferring the filing over the assumption.
+
+    DV01 is scaled by tenor against the supplied seven-year figure. That is a
+    linear duration approximation, crude but the right order of magnitude and
+    far closer than ignoring tenor altogether; it is labelled `derived` so no
+    reader mistakes it for a quoted sensitivity.
+    """
+    financing = assumptions["financing"]
+    market = assumptions["market"]
+
+    default_tenor = float(financing["expected_tenor_years"])
+    notional = Input(
+        float(financing["expected_debt_issuance_usd"]), ASSUMED,
+        "assignment-supplied expected debt issuance",
+    )
+    currency = Input("USD", ASSUMED, "assignment-supplied; the standardized block is USD")
+    tenor = Input(default_tenor, ASSUMED, "assignment-supplied expected tenor")
+    rate_basis = Input(
+        "swap rate", ASSUMED, "assignment-supplied market block"
+    )
+
+    values = _found_values(rows or [])
+
+    if isinstance(values.get("bridge_amount"), (int, float)):
+        notional = Input(
+            float(values["bridge_amount"]), EXTRACTED,
+            "bridge_amount, extracted from the filing",
+        )
+    for field in ("bridge_currency", "consideration_currency"):
+        if isinstance(values.get(field), str):
+            currency = Input(values[field], EXTRACTED, f"{field}, extracted from the filing")
+            break
+    parsed = parse_tenor_years(values.get("bridge_maturity"))
+    if parsed:
+        tenor = Input(
+            round(parsed, 3), EXTRACTED,
+            f"bridge_maturity ({values['bridge_maturity']}), extracted from the filing",
+        )
+    if isinstance(values.get("interest_basis"), str):
+        rate_basis = Input(
+            values["interest_basis"], EXTRACTED,
+            "interest_basis, extracted from the filing",
+        )
+
+    dv01 = compute_dv01(
+        float(notional.value), market["benchmark_dv01_per_100mm"]
+    ) * (float(tenor.value) / default_tenor)
+
+    return FinancingInputs(
+        notional=notional,
+        currency=currency,
+        tenor_years=tenor,
+        rate_basis=rate_basis,
+        dv01=Input(
+            dv01, DERIVED,
+            f"{notional.source} notional x supplied DV01 per 100mm, scaled "
+            f"{tenor.value:g}/{default_tenor:g} years (linear duration approximation)",
+        ),
+    )
+
+
+def _found_values(rows: list[dict]) -> dict:
+    """Asserted values by field name, preferring the governing reading."""
+    if not rows:
+        return {}
+    from ..comparison import compare_layers
+    from ..extraction import models as field_models
+
+    values = {
+        c.field_name: c.preferred_value
+        for c in compare_layers(rows)
+        if c.preferred_value is not None
+    }
+    for row in rows:
+        name = row.get("field_name")
+        if (
+            name not in values
+            and row.get("status") == field_models.FOUND
+            and row.get("normalized_value") is not None
+        ):
+            values[name] = row["normalized_value"]
+    return values
 
 
 def compute_dv01(notional_usd: float, benchmark_dv01_per_100mm: float) -> float:
@@ -381,6 +577,7 @@ def _attribute(
     strategy: str,
     assumptions: dict,
     deal: DealCharacteristics,
+    inputs: FinancingInputs,
 ) -> tuple[dict[str, float], list[str]]:
     """
     Split one scenario's P&L across the seven risks for one strategy.
@@ -390,8 +587,8 @@ def _attribute(
     are different statements and the table has to tell them apart.
     """
     market = assumptions["market"]
-    notional = assumptions["financing"]["expected_debt_issuance_usd"]
-    dv01 = compute_dv01(notional, market["benchmark_dv01_per_100mm"])
+    notional = float(inputs.notional.value)
+    dv01 = float(inputs.dv01.value)
     credit_dv01 = dv01 * ADDITIONAL_ASSUMPTIONS["credit_spread_dv01_ratio"][0]
     swap_spread_dv01 = dv01 * ADDITIONAL_ASSUMPTIONS["swap_spread_dv01_ratio"][0]
     premium_bps = ADDITIONAL_ASSUMPTIONS["deal_contingent_premium_bps"][0]
@@ -466,7 +663,9 @@ def _attribute(
     return attribution, notes
 
 
-def run_scenarios(assumptions=None, horizon=None, deal=None) -> list[ScenarioResult]:
+def run_scenarios(
+    assumptions=None, horizon=None, deal=None, rows=None
+) -> list[ScenarioResult]:
     """
     Every required scenario against every required strategy.
 
@@ -474,7 +673,8 @@ def run_scenarios(assumptions=None, horizon=None, deal=None) -> list[ScenarioRes
     `deal` carries the extracted currency facts that decide FX exposure.
     """
     assumptions = assumptions or BIO_TECHNE_ASSUMPTIONS
-    deal = deal or DealCharacteristics()
+    deal = deal or (deal_from_rows(rows) if rows else DealCharacteristics())
+    inputs = resolve_financing(assumptions, rows)
 
     results: list[ScenarioResult] = []
     for scenario in build_scenarios(assumptions, horizon):
@@ -485,7 +685,7 @@ def run_scenarios(assumptions=None, horizon=None, deal=None) -> list[ScenarioRes
             attribution, notes = (
                 ({factor: 0.0 for factor in RISK_FACTORS}, [])
                 if unavailable
-                else _attribute(scenario, strategy, assumptions, deal)
+                else _attribute(scenario, strategy, assumptions, deal, inputs)
             )
             if scenario.note:
                 notes.insert(0, scenario.note)
@@ -498,13 +698,15 @@ def run_scenarios(assumptions=None, horizon=None, deal=None) -> list[ScenarioRes
                     probability=scenario.probability,
                     delay_days=scenario.delay_days,
                     delayed_to=scenario.delayed_to,
+                    currency=str(inputs.currency.value),
+                    extracted_inputs=inputs.extracted,
                     notes=notes,
                 )
             )
     return results
 
 
-def risk_exposures(assumptions=None, deal=None) -> list[dict]:
+def risk_exposures(assumptions=None, deal=None, rows=None) -> list[dict]:
     """
     Per-basis-point sensitivity of each strategy to each risk.
 
@@ -514,7 +716,8 @@ def risk_exposures(assumptions=None, deal=None) -> list[dict]:
     no scenario happens to shock is still a risk it carries.
     """
     assumptions = assumptions or BIO_TECHNE_ASSUMPTIONS
-    deal = deal or DealCharacteristics()
+    deal = deal or (deal_from_rows(rows) if rows else DealCharacteristics())
+    inputs = resolve_financing(assumptions, rows)
     market = assumptions["market"]
     notional = assumptions["financing"]["expected_debt_issuance_usd"]
     dv01 = compute_dv01(notional, market["benchmark_dv01_per_100mm"])

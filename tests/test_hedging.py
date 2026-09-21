@@ -349,3 +349,109 @@ def test_the_export_shape_carries_every_risk_column():
     assert payload["net_pnl"] == pytest.approx(
         sum(payload[factor] for factor in RISK_FACTORS)
     )
+
+
+# ---------------------------------------------------------------------------
+# Adapting the analytics to the extracted deal (WS5 + WS7)
+# ---------------------------------------------------------------------------
+
+def _fin_row(field_name, value):
+    return {
+        "field_name": field_name, "document_layer": "credit-agreement-ex10.1",
+        "normalized_value": value, "raw_value": str(value), "status": models.FOUND,
+        "currency": None, "printed_page": "1", "pdf_page": 44, "section": None,
+        "evidence": "q", "locator_uri": "d://x", "confidence": 0.95,
+        "review_status": models.UNREVIEWED,
+    }
+
+
+def test_the_notional_comes_from_the_filing_when_it_states_one():
+    """
+    The analysis previously priced a USD 4bn seven-year issuance for every
+    deal, including one whose disclosed facility is EUR 14.2bn over 364 days —
+    with all of those facts already extracted.
+    """
+    from deallens.analytics.hedging import EXTRACTED, resolve_financing
+
+    resolved = resolve_financing(
+        BIO_TECHNE_ASSUMPTIONS,
+        [_fin_row("bridge_amount", 11_500_000_000.0),
+         _fin_row("bridge_currency", "EUR"),
+         _fin_row("bridge_maturity", "364 days after the Closing Date")],
+    )
+    assert resolved.notional.value == 11_500_000_000.0
+    assert resolved.notional.source == EXTRACTED
+    assert resolved.currency.value == "EUR"
+    assert set(resolved.extracted) >= {"notional", "currency", "tenor"}
+
+
+def test_assumptions_are_used_where_the_filing_is_silent():
+    from deallens.analytics.hedging import ASSUMED, resolve_financing
+
+    resolved = resolve_financing(BIO_TECHNE_ASSUMPTIONS, [])
+    assert resolved.notional.value == 4_000_000_000
+    assert resolved.notional.source == ASSUMED
+    assert resolved.tenor_years.value == 7
+    assert resolved.extracted == []
+
+
+def test_dv01_follows_the_stated_tenor():
+    """
+    A 364-day facility carries roughly a seventh of the rate duration of a
+    seven-year issuance. Ignoring tenor overstated its sensitivity sevenfold.
+    """
+    from deallens.analytics.hedging import DERIVED, resolve_financing
+
+    seven_year = resolve_financing(BIO_TECHNE_ASSUMPTIONS, [])
+    one_year = resolve_financing(
+        BIO_TECHNE_ASSUMPTIONS,
+        [_fin_row("bridge_amount", 4_000_000_000.0),
+         _fin_row("bridge_maturity", "364 days after the Closing Date")],
+    )
+    assert seven_year.dv01.value == pytest.approx(DV01)
+    assert float(one_year.dv01.value) == pytest.approx(DV01 * 364 / 365 / 7, rel=1e-3)
+    assert one_year.dv01.source == DERIVED
+
+
+@pytest.mark.parametrize(
+    "text,years",
+    [
+        ("364 days after the Closing Date", 364 / 365),
+        ("5 years from Closing", 5.0),
+        ("18 months", 1.5),
+        ("a 364-day facility", 364 / 365),
+        ("no stated maturity", None),
+        (None, None),
+    ],
+)
+def test_tenor_parsing(text, years):
+    from deallens.analytics.hedging import parse_tenor_years
+
+    parsed = parse_tenor_years(text)
+    if years is None:
+        assert parsed is None
+    else:
+        assert parsed == pytest.approx(years, rel=1e-3)
+
+
+def test_results_report_the_deals_own_currency():
+    """No FX rate is supplied, so a EUR facility is reported in EUR rather
+    than converted at an invented one."""
+    rows = [_fin_row("bridge_amount", 11_500_000_000.0),
+            _fin_row("bridge_currency", "EUR")]
+    results = run_scenarios(rows=rows)
+
+    assert all(r.currency == "EUR" for r in results)
+    assert all("notional" in r.extracted_inputs for r in results)
+
+
+def test_two_different_deals_no_longer_price_identically():
+    """The defect this closes: every filing produced the same grid."""
+    usd = run_scenarios(rows=[])
+    eur = run_scenarios(rows=[_fin_row("bridge_amount", 11_500_000_000.0),
+                              _fin_row("bridge_maturity", "364 days")])
+
+    a = _find(usd, "rates_up_25", UNHEDGED).net_pnl
+    b = _find(eur, "rates_up_25", UNHEDGED).net_pnl
+    assert a != b
+    assert abs(b) < abs(a), "a 364-day facility is less rate-sensitive"

@@ -416,23 +416,25 @@ reading is kept in `notes`.
 
 ## Testing strategy
 
-**233 tests, no network, no API key, no spend.** The model is replaced by a
+**268 tests, no network, no API key, no spend.** The model is replaced by a
 fake that returns whatever payload a test specifies, and documents are built
-by a synthetic PDF factory. The suite runs in about 40 seconds, which is the
+by a synthetic PDF factory. The suite runs in about 45 seconds, which is the
 point: a slow suite is a suite that stops being run. Captured output is in
 `TEST_RESULTS.txt`.
 
 | File | Tests | What it holds down |
 |---|---:|---|
 | `test_extraction.py` | 41 | Page mapping back to the source PDF, the four fail-closed controls, the output schema's shape, model selection and provenance, token-budget chunking, incomplete-source handling |
+| `test_hedging.py` | 39 | The required scenario × strategy grid, sign convention, what each hedge does *not* cover, resolving notional, tenor and rate basis from extracted fields, FX from extracted currencies, probability weighting |
 | `test_ingestion.py` | 39 | Page inventory, text-layer classification, duplicate and unreadable page detection, printed-label reconciliation, layer segmentation, locators |
 | `test_comparison.py` | 32 | The seven WS3 classes, narrative vs typed comparison, the source hierarchy, that a conflicting value is never discarded |
-| `test_hedging.py` | 28 | The required scenario × strategy grid, sign convention, what each hedge does *not* cover, FX from extracted currencies, probability weighting |
 | `test_qa.py` | 25 | Answering only from asserted fields, the unsupported-answer sentence, refusal and truncation handling, prompt-injection fencing |
 | `test_timeline.py` | 21 | The six date kinds, calculated dates and their derivations, refusing to place undatable entries, the hedge horizon |
 | `test_review.py` | 18 | Manual correction and disclosure, normalization of reviewer input, conflicts reaching the queue |
 | `test_generalization.py` | 17 | Document shapes and transaction structures beyond the development filing, financing-exhibit recognition |
+| `test_pdf.py` | 15 | The Markdown subset the deliverables use, and that an unrecognised construct degrades to plain text rather than stalling the renderer |
 | `test_persistence.py` | 12 | Database round-trip, re-ingestion, the audit record |
+| `test_export.py` | 9 | One sheet per table, per-document scoping, the required-schema JSON shape, cell-length limits |
 
 Three principles shape what is tested:
 

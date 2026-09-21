@@ -164,11 +164,11 @@ All five are also downloadable as PDFs from the Export page.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-257 tests, about 45 seconds. They need no API key and make no network calls —
+268 tests, about 45 seconds. They need no API key and make no network calls —
 the model is replaced by a stand-in, and test documents are generated rather
 than downloaded. A captured run is in `TEST_RESULTS.txt`.
 
-On a fresh clone you will see **234 pass and 23 skip**. The skipped ones check
+On a fresh clone you will see **245 pass and 23 skip**. The skipped ones check
 behaviour against a real filing, which is not committed (see below); each skip
 names the file and where to download it.
 
@@ -190,7 +190,7 @@ deallens/
   pdf.py                documents as PDFs
   db/                   the database, and what it records
 scripts/                pricing a run, exporting outputs
-tests/                  257 tests
+tests/                  268 tests
 outputs/                extracted data for the three sample filings
 deallens_seed.db        those three filings, ready to open in the app
                         (the source PDFs are not committed; links are in
