@@ -369,17 +369,15 @@ the model extracting from a filing.
       configuration tweak, and it raises the run cost materially
 - [ ] WS7: extraction and cross-transaction analysis for Organon and Uber;
       hedging assumptions not yet adapted per deal
-- [ ] **No live extraction has been run against any of the three case
-      filings.** Ingestion runs end to end on all three and each prices
-      offline; the paid calls are the step still outstanding, and they block
-      the machine-readable extraction outputs deliverable:
-
-      | Filing | Pages | Layers | Structure | Estimate |
-      |---|---|---|---|---|
-      | development (US merger) | 99 | 3 | `merger` 1.00 | $1.64–2.89 |
-      | validation 1 (US merger) | 109 | 4 | `merger` 0.73 | $1.74–2.99 |
-      | validation 2 (German takeover) | 149 | 5 | `takeover_offer` 0.87 | $2.34–4.22 |
 - [ ] Streamlit Cloud deployment not yet done
+- [ ] **Storage is a per-session copy, not a database.** With
+      `deallens_seed.db` present the app copies it to a temp file per session,
+      so uploads and review corrections live and die with that session; only
+      `DEALLENS_DB` gives a shared file, and a file is still single-writer.
+      Moving to a live database server — Postgres behind the same `deallens.db`
+      interface — is what makes a correction durable and lets two reviewers
+      work the queue at once. It touches connection handling and the schema's
+      SQLite-specific types, so it is a real port rather than a URL change
 
 ---
 

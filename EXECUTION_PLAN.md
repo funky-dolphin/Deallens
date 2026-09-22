@@ -152,7 +152,7 @@ are marked `critical`** and held to a 0.75 confidence bar rather than 0.60.
 - Bio-Techne / Merck KGaA (development)
 - Organon / Sun Pharma (validation 1)
 - Uber / Delivery Hero (validation 2)
-**Ingestion run against all three (extraction still outstanding):**
+**Ingestion and extraction both run against all three:**
 
 | | Bio-Techne | Organon | Uber / Delivery Hero |
 |---|---|---|---|
@@ -161,7 +161,12 @@ are marked `critical`** and held to a 0.75 confidence bar rather than 0.60.
 | machine-readable | yes | yes | no |
 | layers | 3 | 4 | 5 |
 | may extract | yes | yes | **no** |
-| estimated cost | $1.64–2.89 | $1.74–2.99 | $1.25–2.50 |
+| layers extracted | 2 | 2 | 3 |
+| fields asserted | 53 | 50 | 58 |
+| fields recorded | 98 | 98 | 108 |
+
+Extraction ran live against the API on `claude-opus-5` at prompt version
+3.0.0; the results in `deallens_seed.db` are those runs, not fixtures.
 
 - **The classifier identified the German takeover offer unprompted**, on
   evidence it found itself: "voluntary public takeover offer",
